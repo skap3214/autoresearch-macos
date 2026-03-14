@@ -8,26 +8,134 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+import csv
 import gc
+import json
+import subprocess
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
 
-import sys
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def verify_macos_env():
-    if sys.platform != "darwin":
-        raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
-    if not torch.backends.mps.is_available():
-        raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon with a compatible PyTorch build.")
-    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
+def report_environment():
+    if torch.cuda.is_available():
+        device_name = "cuda"
+    elif torch.backends.mps.is_available():
+        device_name = "mps"
+    else:
+        device_name = "cpu"
+    print(f"Environment detected: {device_name}")
     print()
 
-verify_macos_env()
+report_environment()
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import (
+    MAX_SEQ_LEN,
+    TIME_BUDGET,
+    Tokenizer,
+    evaluate_policy,
+    get_experiment_manifest,
+    make_dataloader,
+)
+
+RUNS_DIR = Path(__file__).resolve().parent / "runs"
+
+
+def create_run_dir() -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = RUNS_DIR / timestamp
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def make_json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(key): make_json_safe(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_safe(value) for value in obj]
+    return obj
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def git_metadata() -> dict[str, object]:
+    repo_dir = Path(__file__).resolve().parent
+
+    def run_git(args: list[str]) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        return result.stdout.strip()
+
+    status = run_git(["status", "--short"])
+    return {
+        "commit": run_git(["rev-parse", "HEAD"]),
+        "branch": run_git(["branch", "--show-current"]),
+        "is_dirty": bool(status),
+        "status_short": status.splitlines() if status else [],
+    }
+
+# ---------------------------------------------------------------------------
+# Fast value MLP for search guidance
+# ---------------------------------------------------------------------------
+
+class ValueMLP(nn.Module):
+    """Tiny MLP that predicts distance-to-goal from raw sticker colors.
+    ~100K params, evaluates in microseconds — fast enough for search."""
+
+    def __init__(self, n_stickers: int = 24, n_colors: int = 6, hidden: int = 256):
+        super().__init__()
+        self.embed = nn.Embedding(n_colors, 16)
+        self.net = nn.Sequential(
+            nn.Linear(n_stickers * 16, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, stickers: torch.Tensor) -> torch.Tensor:
+        """stickers: (B, 24) integer tensor of color indices 0-5."""
+        x = self.embed(stickers)       # (B, 24, 16)
+        x = x.view(x.size(0), -1)     # (B, 384)
+        return self.net(x).squeeze(-1) # (B,)
+
+# Color token ID → color index mapping (built at runtime)
+_COLOR_TOKEN_MAP: dict[int, int] | None = None
+
+def _get_color_map(tokenizer) -> dict[int, int]:
+    global _COLOR_TOKEN_MAP
+    if _COLOR_TOKEN_MAP is None:
+        _COLOR_TOKEN_MAP = {
+            tokenizer.token_to_id[f"COL_{c}"]: i
+            for i, c in enumerate(("W", "Y", "G", "B", "R", "O"))
+        }
+    return _COLOR_TOKEN_MAP
+
+def _extract_stickers_from_batch(input_ids: torch.Tensor, tokenizer) -> torch.Tensor:
+    """Extract 24 sticker color indices from input_ids batch. Stickers at positions 5-28."""
+    color_map = _get_color_map(tokenizer)
+    sticker_tokens = input_ids[:, 5:29]  # (B, 24) COL_X token IDs
+    stickers = torch.zeros_like(sticker_tokens)
+    for token_id, color_idx in color_map.items():
+        stickers[sticker_tokens == token_id] = color_idx
+    return stickers
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -154,6 +262,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Value head: predicts distance-to-goal (scalar) for search guidance
+        self.value_head = nn.Linear(config.n_embd, 1, bias=True)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -194,6 +304,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # Value head: init to predict ~5 (midrange distance)
+        torch.nn.init.normal_(self.value_head.weight, mean=0.0, std=0.01)
+        torch.nn.init.constant_(self.value_head.bias, 5.0)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -263,15 +376,18 @@ class GPT(nn.Module):
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        value_head_params = list(self.value_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(value_head_params) +
+            len(resid_params) + len(x0_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=value_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
@@ -288,7 +404,8 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, reduction='mean'):
+    def _backbone(self, idx):
+        """Run transformer backbone, return final hidden states."""
         B, T = idx.size()
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -300,7 +417,10 @@ class GPT(nn.Module):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
-        x = norm(x)
+        return norm(x)
+
+    def forward(self, idx, targets=None, distances=None, reduction='mean'):
+        x = self._backbone(idx)
 
         softcap = 15
         logits = self.lm_head(x)
@@ -308,10 +428,30 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
+            policy_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                          ignore_index=-1, reduction=reduction)
+            if distances is not None:
+                # Value prediction at the position before the supervised token
+                # Use mask multiplication to avoid gather (MPS bf16 backward compat)
+                sup_mask = (targets != -1).float()  # (B, T) — 1 at supervised position
+                # Shift mask left by 1 to get the position BEFORE the answer token
+                value_mask = torch.zeros_like(sup_mask)
+                value_mask[:, :-1] = sup_mask[:, 1:]
+                # value_mask has a 1 at the last prompt position for each example
+                x_f32 = x.float()
+                value_all = self.value_head(x_f32).squeeze(-1)  # (B, T)
+                value_pred = (value_all * value_mask).sum(dim=1)  # (B,)
+                value_loss = F.mse_loss(value_pred, distances)
+                return policy_loss + 0.5 * value_loss  # auxiliary value objective
+            return policy_loss
         return logits
+
+    def predict_value(self, idx):
+        """Predict distance-to-goal from state tokens. Used for search."""
+        x = self._backbone(idx)
+        # Use the last non-pad position for value prediction
+        value_pred = self.value_head(x[:, -1, :]).squeeze(-1)
+        return value_pred
 
 # ---------------------------------------------------------------------------
 # Optimizer (MuonAdamW, single GPU only)
@@ -481,24 +621,27 @@ class MuonAdamW(torch.optim.Optimizer):
 
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
+HEAD_DIM = 64           # target head dimension for attention (4 heads for more diverse patterns)
 WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 
+# Sequence length for training (flat state + up to 3 history moves + 1-token answer ≈ 34 tokens)
+TRAIN_SEQ_LEN = 36
+
 # Optimization
-TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2304  # = 64 * 36, one microstep per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.12        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+WEIGHT_DECAY = 0.0      # no weight decay (best config)
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+WARMUP_RATIO = 0.05     # fraction of time budget for LR warmup
+WARMDOWN_RATIO = 0.15   # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 4               # number of transformer layers
-DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 64  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -529,6 +672,12 @@ tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
+run_dir = create_run_dir()
+metrics_csv_path = run_dir / "train_metrics.csv"
+summary_json_path = run_dir / "summary.json"
+loss_plot_path = run_dir / "loss.png"
+print(f"Run directory: {run_dir}")
+
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
@@ -541,6 +690,43 @@ def build_model_config(depth):
 
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
+
+summary_base = {
+    "status": "running",
+    "started_at": now_iso(),
+    "run_dir": str(run_dir),
+    "git": git_metadata(),
+    "config": {
+        "device_type": device_type,
+        "torch_seed": 42,
+        "max_seq_len": MAX_SEQ_LEN,
+        "train_seq_len": TRAIN_SEQ_LEN,
+        "depth": DEPTH,
+        "device_batch_size": DEVICE_BATCH_SIZE,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "aspect_ratio": ASPECT_RATIO,
+        "head_dim": HEAD_DIM,
+        "window_pattern": WINDOW_PATTERN,
+        "embedding_lr": EMBEDDING_LR,
+        "unembedding_lr": UNEMBEDDING_LR,
+        "matrix_lr": MATRIX_LR,
+        "scalar_lr": SCALAR_LR,
+        "weight_decay": WEIGHT_DECAY,
+        "adam_betas": ADAM_BETAS,
+        "warmup_ratio": WARMUP_RATIO,
+        "warmdown_ratio": WARMDOWN_RATIO,
+        "final_lr_frac": FINAL_LR_FRAC,
+    },
+    "model_config": make_json_safe(asdict(config)),
+    "protocol": make_json_safe(get_experiment_manifest()),
+    "artifacts": {
+        "metrics_csv": str(metrics_csv_path),
+        "loss_plot": str(loss_plot_path),
+        "summary_json": str(summary_json_path),
+    },
+}
+with open(summary_json_path, "w", encoding="utf-8") as f:
+    json.dump(summary_base, f, indent=2)
 
 with torch.device("meta"):
     model = GPT(config)
@@ -555,9 +741,14 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+tokens_per_fwdbwd = DEVICE_BATCH_SIZE * TRAIN_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+summary_base["config"]["grad_accum_steps"] = grad_accum_steps
+summary_base["config"]["num_params_m"] = num_params / 1e6
+summary_base["config"]["estimated_flops_per_token"] = num_flops_per_token
+with open(summary_json_path, "w", encoding="utf-8") as f:
+    json.dump(summary_base, f, indent=2)
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -572,11 +763,34 @@ optimizer = model.setup_optimizer(
 if device_type == "cuda":
     model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
+# Value MLP for fast search guidance
+value_mlp = ValueMLP().to(device)
+value_mlp_optimizer = torch.optim.Adam(value_mlp.parameters(), lr=1e-3)
+
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, TRAIN_SEQ_LEN, "train")
+x, y, d, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+metrics_file = open(metrics_csv_path, "w", newline="", encoding="utf-8")
+metrics_writer = csv.DictWriter(
+    metrics_file,
+    fieldnames=[
+        "step",
+        "progress",
+        "loss",
+        "lr_multiplier",
+        "dt_ms",
+        "tok_per_sec",
+        "mfu_percent",
+        "epoch",
+        "remaining_seconds",
+    ],
+)
+metrics_writer.writeheader()
+metrics_file.flush()
+loss_history: list[tuple[int, float]] = []
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -597,6 +811,99 @@ def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
 
 # ---------------------------------------------------------------------------
+# DAgger: mid-training on-policy data collection
+# ---------------------------------------------------------------------------
+
+DAGGER_TRIGGER_FRACS = [0.5]  # single DAgger round at midpoint
+DAGGER_NUM_EPISODES = 200   # rollouts to collect
+DAGGER_MAX_STEPS = 15       # steps per rollout
+
+from prepare import (
+    _select_move_with_search,
+    encode_supervised_example,
+    _example_stream,
+    get_runtime_device,
+)
+from rubiks import Cube, build_prompt_tokens, build_answer_tokens, random_scramble, scramble_length_for_size
+from teacher_dwalton import solve_cube_222
+import random as _random
+
+
+def collect_dagger_data(model, tokenizer, num_episodes=DAGGER_NUM_EPISODES,
+                        max_steps=DAGGER_MAX_STEPS):
+    """Roll out the current policy and collect teacher corrections at visited states."""
+    rng = _random.Random(int(time.time()))  # different data each run
+    examples = []
+    for _ in range(num_episodes):
+        scramble = random_scramble(size=2, length=scramble_length_for_size(2), rng=rng)
+        cube = Cube(2)
+        cube.apply_moves(scramble)
+        history = []
+        visited = {cube.to_kociemba_string()}
+
+        for _ in range(max_steps):
+            if cube.has_uniform_faces():
+                break
+
+            # Get teacher correction at this on-policy state
+            try:
+                teacher_solution = solve_cube_222(cube)
+                if teacher_solution:
+                    prompt_tokens = build_prompt_tokens(2, cube, history=history)
+                    answer_tokens = build_answer_tokens(teacher_solution[0])
+                    encoded = encode_supervised_example(tokenizer, prompt_tokens, answer_tokens)
+                    encoded["size"] = 2
+                    encoded["distance_to_goal"] = len(teacher_solution)
+                    examples.append(encoded)
+            except Exception:
+                pass
+
+            # Follow the MODEL's policy (not teacher's) to visit on-policy states
+            move = _select_move_with_search(model, tokenizer, cube, history, visited)
+            if move is None:
+                break
+            try:
+                cube.apply_move(move)
+            except Exception:
+                break
+            history.append(move)
+            visited.add(cube.to_kociemba_string())
+
+    return examples
+
+
+def _make_dataloader_from_examples(tokenizer, examples, B, T, shuffle=True):
+    """Create a dataloader from an in-memory list of examples."""
+    stream = _example_stream(examples, shuffle=shuffle)
+    device_str = get_runtime_device()
+    pad_id = tokenizer.get_pad_token_id()
+
+    cpu_inputs = torch.full((B, T), pad_id, dtype=torch.long, pin_memory=(device_str == "cuda"))
+    cpu_targets = torch.full((B, T), -1, dtype=torch.long, pin_memory=(device_str == "cuda"))
+    cpu_distances = torch.zeros(B, dtype=torch.float32, pin_memory=(device_str == "cuda"))
+    inputs = torch.full((B, T), pad_id, dtype=torch.long, device=device_str)
+    targets = torch.full((B, T), -1, dtype=torch.long, device=device_str)
+    distances = torch.zeros(B, dtype=torch.float32, device=device_str)
+
+    while True:
+        for row_idx in range(B):
+            example, epoch = next(stream)
+            input_ids = example["input_ids"]
+            target_ids = example["targets"]
+            seq_len = min(len(input_ids), T)
+            cpu_inputs[row_idx].fill_(pad_id)
+            cpu_targets[row_idx].fill_(-1)
+            cpu_inputs[row_idx, :seq_len] = torch.tensor(input_ids[:seq_len], dtype=torch.long)
+            cpu_targets[row_idx, :seq_len] = torch.tensor(target_ids[:seq_len], dtype=torch.long)
+            cpu_distances[row_idx] = float(example.get("distance_to_goal", 0))
+
+        inputs.copy_(cpu_inputs, non_blocking=(device_str == "cuda"))
+        targets.copy_(cpu_targets, non_blocking=(device_str == "cuda"))
+        distances.copy_(cpu_distances, non_blocking=(device_str == "cuda"))
+        yield inputs, targets, distances, epoch
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -604,6 +911,8 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+dagger_round = 0  # which DAgger round we're on (0 = not yet triggered)
+all_dagger_examples: list = []
 
 def sync_device(device_type):
     if device_type == "cuda":
@@ -616,11 +925,11 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y, distances=d)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
-        x, y, epoch = next(train_loader)
+        x, y, d, epoch = next(train_loader)
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -635,6 +944,14 @@ while True:
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
+    # Train value MLP on same batch (fast, negligible overhead)
+    stickers = _extract_stickers_from_batch(x, tokenizer)
+    mlp_pred = value_mlp(stickers)
+    mlp_loss = F.mse_loss(mlp_pred, d)
+    mlp_loss.backward()
+    value_mlp_optimizer.step()
+    value_mlp_optimizer.zero_grad()
+
     train_loss_f = train_loss.item()
 
     # Fast fail: abort if loss is exploding
@@ -646,8 +963,23 @@ while True:
     t1 = time.time()
     dt = t1 - t0
 
-    if step > 10:
+    if step > 10 and dt < 5.0:  # exclude MPS stalls from time budget
         total_training_time += dt
+
+    # DAgger: collect on-policy data at each trigger fraction
+    if dagger_round < len(DAGGER_TRIGGER_FRACS) and total_training_time >= TIME_BUDGET * DAGGER_TRIGGER_FRACS[dagger_round]:
+        dagger_round += 1
+        print(f"\n  DAgger round {dagger_round}/{len(DAGGER_TRIGGER_FRACS)}: collecting on-policy data at step {step}...")
+        model.eval()
+        new_examples = collect_dagger_data(model, tokenizer)
+        model.train()
+        all_dagger_examples.extend(new_examples)
+        from prepare import load_dataset as _load_ds
+        base_examples = _load_ds()["train_examples"]
+        augmented = base_examples + all_dagger_examples
+        train_loader = _make_dataloader_from_examples(tokenizer, augmented, DEVICE_BATCH_SIZE, TRAIN_SEQ_LEN)
+        x, y, d, epoch = next(train_loader)
+        print(f"  DAgger: +{len(new_examples)} examples (cumulative {len(all_dagger_examples)}, total {len(augmented)}). Resuming.")
 
     # Logging
     ema_beta = 0.9
@@ -659,6 +991,19 @@ while True:
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    metrics_writer.writerow({
+        "step": step,
+        "progress": progress,
+        "loss": debiased_smooth_loss,
+        "lr_multiplier": lrm,
+        "dt_ms": dt * 1000,
+        "tok_per_sec": tok_per_sec,
+        "mfu_percent": mfu,
+        "epoch": epoch,
+        "remaining_seconds": remaining,
+    })
+    metrics_file.flush()
+    loss_history.append((step, debiased_smooth_loss))
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -680,8 +1025,43 @@ total_tokens = step * TOTAL_BATCH_SIZE
 
 # Final eval
 model.eval()
+value_mlp.eval()
+model.value_mlp = value_mlp  # attach for search use
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    eval_metrics = evaluate_policy(model, tokenizer, DEVICE_BATCH_SIZE)
+
+# Trajectory diagnostics: inspect a panel of held-out rollouts
+from prepare import load_dataset, _cube_residual_error, _select_move_with_search
+from rubiks import Cube, Episode
+
+diag_payload = load_dataset()
+diag_episodes = [Episode.from_dict(e) for e in diag_payload["eval_episodes"]["id"][:4]]
+print("\n--- Trajectory diagnostics (4 held-out episodes) ---")
+for ep_idx, episode in enumerate(diag_episodes):
+    cube = Cube(episode.size)
+    cube.apply_moves(episode.scramble)
+    init_residual = _cube_residual_error(cube)
+    moves_taken = []
+    visited_states = {cube.to_kociemba_string()}
+    outcome = "exhausted"
+    for step_i in range(50):
+        if cube.has_uniform_faces():
+            outcome = "SOLVED"
+            break
+        move = _select_move_with_search(model, tokenizer, cube, moves_taken, visited_states)
+        if move is None:
+            outcome = "premature_done"
+            break
+        try:
+            cube.apply_move(move)
+        except Exception:
+            outcome = "invalid_move"
+            break
+        moves_taken.append(move)
+        visited_states.add(cube.to_kociemba_string())
+    final_residual = _cube_residual_error(cube)
+    print(f"  ep{ep_idx}: sol_len={len(episode.solution)} init_res={init_residual} final_res={final_residual} steps={len(moves_taken)} outcome={outcome}")
+print()
 
 # Final summary
 t_end = time.time()
@@ -693,7 +1073,12 @@ else:
     peak_vram_mb = 0.0
 
 print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
+print(f"primary_metric:   {eval_metrics['primary_metric']:.6f}")
+print(f"id_move_acc:      {eval_metrics['id_move_accuracy']:.6f}")
+print(f"ood_dev_move_acc: {eval_metrics['ood_dev_move_accuracy']:.6f}")
+print(f"id_solve_rate:    {eval_metrics['id_solve_rate']:.6f}")
+print(f"ood_dev_solve:    {eval_metrics['ood_dev_solve_rate']:.6f}")
+print(f"ood_test_solve:   {eval_metrics['ood_test_solve_rate']:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
@@ -702,3 +1087,53 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+for split_name, metrics in eval_metrics["size_metrics"].items():
+    if not metrics:
+        continue
+    size_summary = " ".join(
+        f"{size}:{stats['solve_rate']:.2f}"
+        for size, stats in sorted(metrics.items())
+    )
+    print(f"{split_name}_solve_by_size: {size_summary}")
+
+metrics_file.close()
+
+if loss_history:
+    xs, ys = zip(*loss_history)
+    plt.figure(figsize=(8, 4.5))
+    plt.plot(xs, ys, color="#225c4a", linewidth=2)
+    plt.title("Training Loss")
+    plt.xlabel("Step")
+    plt.ylabel("Smoothed Loss")
+    plt.grid(alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(loss_plot_path, dpi=180)
+    plt.close()
+
+summary_payload = {
+    **summary_base,
+    "status": "completed",
+    "finished_at": now_iso(),
+    "results": {
+        "primary_metric": eval_metrics["primary_metric"],
+        "id_move_accuracy": eval_metrics["id_move_accuracy"],
+        "ood_dev_move_accuracy": eval_metrics["ood_dev_move_accuracy"],
+        "id_solve_rate": eval_metrics["id_solve_rate"],
+        "ood_dev_solve_rate": eval_metrics["ood_dev_solve_rate"],
+        "ood_test_solve_rate": eval_metrics["ood_test_solve_rate"],
+        "training_seconds": total_training_time,
+        "total_seconds": t_end - t_start,
+        "peak_vram_mb": peak_vram_mb,
+        "mfu_percent": steady_state_mfu,
+        "total_tokens_m": total_tokens / 1e6,
+        "num_steps": step,
+        "num_params_m": num_params / 1e6,
+    },
+    "size_metrics": make_json_safe(eval_metrics["size_metrics"]),
+}
+with open(summary_json_path, "w", encoding="utf-8") as f:
+    json.dump(summary_payload, f, indent=2)
+
+print(f"metrics_csv:      {metrics_csv_path}")
+print(f"loss_plot:        {loss_plot_path}")
+print(f"summary_json:     {summary_json_path}")

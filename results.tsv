@@ -1,0 +1,50 @@
+commit	primary_metric	id_move_acc	id_solve_rate	mean_residual	num_steps	status	description
+140918	0.000000	0.217608	0.000000	20.25	247	keep	baseline: D=4 dim=256 T=1024 B=16 TBS=65K structured-14tok unconstrained
+142741	0.000000	0.337209	0.000000	20.33	3596	keep	T=96 B=64 TBS=6144 structured-14tok constrained-decoding (256 episodes)
+143626	0.000000	0.370432	0.000000	20.00	3632	keep	+4096 episodes (38K train examples)
+144956	0.000000	0.438538	0.000000	19.95	5128	keep	compact-3tok answer format T=72 TBS=4608
+150142	0.000000	0.348837	0.000000	19.92	3259	discard	D=6 dim=384 10.7M params - too slow, fewer epochs
+150805	0.000000	0.441860	0.000000	19.48	4986	keep	flat state (no markers) T=36 TBS=2304 warmdown=0.3
+exp6	0.015625	0.401993	0.015625	19.50	5326	keep	+action history(3) +no-inverse rule MAX_SEQ=48 T=40 TBS=2560
+exp7	0.000000	0.471761	0.000000	-	5473	discard	warmdown=0.15 (worse solve rate despite higher move_acc)
+exp8	0.000000	0.458472	0.000000	-	5506	discard	+state-avoidance search +residual-guided turns (residual minima trap)
+exp9	0.000000	0.478261	0.000000	-	5756	discard	HEAD_DIM=64 (4 heads) 1024 episodes uniform-face residual
+exp10	0.000000	0.530100	0.000000	-	5913	keep	joint MOVE_face_turn tokens (1-token answer, 19-class classifier)
+exp13	0.046875	0.519868	0.046875	10.62	6158	keep	hybrid search + 2048 episodes + MATRIX_LR=0.06
+exp14	0.031250	0.560201	0.031250	-	6056	discard	1024 episodes + LR=0.08 + warmup (higher acc but less generalization)
+exp15	0.078125	0.500000	0.078125	10.52	4774	keep	BEST: 4096 episodes + MATRIX_LR=0.08 + hybrid search
+exp16	0.031250	0.505000	0.031250	11.47	4079	discard	8192 episodes (too many, only 3.4 epochs)
+exp17	0.031250	0.417219	0.031250	10.27	3851	discard	DAgger 4096eps (61K examples, only 4 epochs - underfitting)
+exp18	0.000000	0.506536	0.000000	10.33	4461	discard	DAgger 2048eps temp=1.0 (too noisy sampling)
+repro	0.015625	0.485050	0.015625	11.78	5019	keep	exp15 baseline reproduction (deterministic, clean)
+curr1	0.046875	0.485050	0.046875	10.67	4660	keep	+curriculum scramble lengths [2,4,6,8,10,14]
+curr3	0.085938	0.579100	0.085938	10.20	4857	keep	curriculum + 256 eval eps + solver hang fix (22/256 solved)
+nocurr	0.070312	0.613172	0.070312	9.32	5920	keep	no-curriculum baseline w/ 256 eval (18/256)
+lr12	0.117188	0.563985	0.117188	8.52	6016	keep	BEST: MATRIX_LR=0.12 75 rollout steps (30/256 solved)
+look2	0.015625	0.550876	0.015625	9.67	5797	discard	2-ply deterministic lookahead (top-3, discount=0.5): regression in solve rate and ~4x eval wall-clock
+dagger1	0.156250	0.615096	0.156250	9.15	5410	keep	BEST: real DAgger mid-training (2995 on-policy examples at step 2721) 40/256 solved
+dagger2a	0.078125	0.565888	0.078125	10.38	5585	discard	too much DAgger (300eps/6000ex) + earlier trigger (0.4) — over-diluted
+dagger2b	0.109375	0.564637	0.109375	10.14	5542	keep	reproduce best DAgger config (200eps) — 28/256 solved (confirms improvement)
+2rnd	0.078125	0.580901	0.078125	10.45	5316	discard	two DAgger rounds (150eps each at 33%/66%) — diluted
+wd01	0.042969	0.488741	0.042969	11.12	5883	discard	WEIGHT_DECAY=0.1 — regularization hurts
+valsrch	0.003906	0.606756	0.003906	13.18	5044	discard	value-guided search (poorly trained value head made search worse)
+valaux	0.113281	0.570892	0.113281	9.54	4879	keep	value head as auxiliary loss + DAgger + residual search (29/256)
+vblend	0.074219	0.590075	0.074219	11.61	4945	discard	blended value+residual search — value head not trained enough
+dag3s	0.113281	0.598415	0.113281	10.11	5175	keep	3-step correction DAgger paths (8976 examples) — same as single-step
+vprim	-	-	-	-	5592	crash	value-primary (1.0) + value-guided search — eval took >1.5h, killed
+vprimr	0.050781	0.531693	0.050781	11.04	5914	discard	value-primary loss (0.2CE+1.0MSE) + residual search — policy degraded
+mlpsrch	-	-	-	-	5164	crash	fast MLP value search — MPS per-call overhead still too slow (54min eval), killed
+best	0.160156	0.625521	0.160156	8.97	5196	keep	BEST: DAgger + aux value head + MLP trained + residual search (41/256)
+dag06	0.125000	0.607173	0.125000	9.68	4693	discard	DAGGER_TRIGGER_FRAC=0.6 — within variance, not clearly better
+noval	0.035156	0.559633	0.035156	10.45	5134	discard	ABLATION: no value loss — 9/256, confirms value head helps (3.5x worse)
+val08	0.074219	0.583820	0.074219	9.75	5103	discard	value weight 0.8 — too high, 19/256 (sweet spot is 0.5)
+dag300	0.093750	0.585071	0.093750	9.35	4824	discard	DAGGER_NUM_EPISODES=300 — 24/256, more DAgger data dilutes training
+lr10	0.160156	0.629691	0.160156	8.21	5004	keep	MATRIX_LR=0.10 — 41/256, ties best! mean_res=8.21 (best ever)
+rs100	0.218750	0.613845	0.218750	7.80	4158	keep	BEST: ROLLOUT_MIN_STEPS=100 — 56/256 solved! model needed more eval steps
+rs150	0.167969	0.579233	0.167969	8.50	4983	discard	ROLLOUT_MIN_STEPS=150 — 43/256, no gain over 100 (training variance)
+rd1	0.000000	0.594662	0.000000	10.23	4599	discard	SEARCH_RESIDUAL_DELTA=1 — 0/256! too restrictive, blocks sacrifice moves
+rd3	0.160156	0.574229	0.160156	9.21	4555	discard	SEARCH_RESIDUAL_DELTA=3 — 41/256, too permissive (delta=2 is sweet spot)
+tk5	0.191406	0.618849	0.191406	8.38	4806	discard	SEARCH_LOOKAHEAD_TOP_K=5 — 49/256, no clear gain over K=3
+ep6k	0.179688	0.605505	0.179688	8.21	4382	discard	TRAIN_EPISODES=6144 — 46/256, fewer epochs hurt despite more diversity
+t1200	0.175781	0.605922	0.175781	8.72	17401	discard	TIME_BUDGET=1200 (20min) — 45/256, overfitted same data (loss=0.27 but no generalization gain)
+t1200e8k	0.402344	0.679733	0.402344	5.95	19660	keep	BEST: TIME_BUDGET=1200 + 8192 episodes — 103/256 solved (40.2%)! more data+time wins
