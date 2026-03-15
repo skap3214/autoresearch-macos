@@ -48,3 +48,5 @@ tk5	0.191406	0.618849	0.191406	8.38	4806	discard	SEARCH_LOOKAHEAD_TOP_K=5 — 49
 ep6k	0.179688	0.605505	0.179688	8.21	4382	discard	TRAIN_EPISODES=6144 — 46/256, fewer epochs hurt despite more diversity
 t1200	0.175781	0.605922	0.175781	8.72	17401	discard	TIME_BUDGET=1200 (20min) — 45/256, overfitted same data (loss=0.27 but no generalization gain)
 t1200e8k	0.402344	0.679733	0.402344	5.95	19660	keep	BEST: TIME_BUDGET=1200 + 8192 episodes — 103/256 solved (40.2%)! more data+time wins
+d8gpu	0.933594	0.825688	0.933594	-	50078	keep	D=8 dim=512 25.4M params + 32K episodes + TIME_BUDGET=3600 + RTX 5090 — 239/256 solved (93.4%)
+d8e64k	1.000000	0.839867	1.000000	-	51547	keep	BEST: D=8 + 64K episodes + ROLLOUT_MIN_STEPS=200 — 256/256 solved (100%)!

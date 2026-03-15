@@ -70,6 +70,53 @@ This code currently requires that you have a single NVIDIA GPU. In principle it 
 
 If you're going to be using autoresearch on Apple Macbooks in particular, I'd recommend one of the forks below. On top of this, if you'd like half-decent results at such a small scale, I'd recommend this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean) which is cleaner than what exists out there otherwise. It should be a drop in replacement because I have encoded it in exactly the same format. Any of your favorite coding agents should be able to do the swap :)
 
+## 2x2 Rubik's Cube Solver (100% solve rate)
+
+This branch includes a fully trained 2x2 Rubik's Cube solver that achieves **100% solve rate** on 256 held-out cubes. The model is a 25.4M parameter transformer (8 layers, dim=512) trained via imitation learning with DAgger and an auxiliary value head.
+
+### Download the trained model
+
+The trained model is hosted on Hugging Face:
+
+```bash
+# Option 1: Clone the full model repo (includes code + 98MB checkpoint)
+git lfs install
+git clone https://huggingface.co/soamikapadia/rubiks-2x2-solver
+cd rubiks-2x2-solver
+pip install torch
+python playground.py --device cpu
+
+# Option 2: Download just the checkpoint via Python
+pip install huggingface_hub
+python -c "
+from huggingface_hub import hf_hub_download
+hf_hub_download('soamikapadia/rubiks-2x2-solver', 'model.pt', local_dir='.')
+"
+
+# Option 3: Direct download via curl
+curl -L https://huggingface.co/soamikapadia/rubiks-2x2-solver/resolve/main/model.pt -o model.pt
+```
+
+### Interactive playground
+
+Once you have the model, launch the web playground:
+
+```bash
+# Using the model from this repo (after training)
+python playground.py --checkpoint runs/<run>/model.pt
+
+# Using the downloaded model
+python playground.py --checkpoint model.pt --device cpu
+```
+
+This opens a web UI at `http://localhost:8080` with a 3D cube you can scramble and watch the model solve in real-time.
+
+### Training report
+
+See [REPORT.md](REPORT.md) for the full experiment history (50+ experiments) and analysis of what worked and what didn't.
+
+**Model card:** [huggingface.co/soamikapadia/rubiks-2x2-solver](https://huggingface.co/soamikapadia/rubiks-2x2-solver)
+
 ## Notable forks
 
 - [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos)

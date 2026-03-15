@@ -628,7 +628,7 @@ WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 TRAIN_SEQ_LEN = 36
 
 # Optimization
-TOTAL_BATCH_SIZE = 2304  # = 64 * 36, one microstep per optimizer step
+TOTAL_BATCH_SIZE = 18432  # = 512 * 36, one microstep per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.12        # learning rate for matrix parameters (Muon)
@@ -640,8 +640,8 @@ WARMDOWN_RATIO = 0.15   # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 4               # number of transformer layers
-DEVICE_BATCH_SIZE = 64  # per-device batch size (reduce if OOM)
+DEPTH = 8               # number of transformer layers
+DEVICE_BATCH_SIZE = 512  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -1022,6 +1022,19 @@ while True:
 print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
+
+# Save model checkpoint
+checkpoint_path = run_dir / "model.pt"
+# Unwrap compiled model if needed
+raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+torch.save({
+    'model_state_dict': raw_model.state_dict(),
+    'value_mlp_state_dict': value_mlp.state_dict(),
+    'config': asdict(config),
+    'step': step,
+    'total_tokens': total_tokens,
+}, checkpoint_path)
+print(f"Saved checkpoint: {checkpoint_path}")
 
 # Final eval
 model.eval()
