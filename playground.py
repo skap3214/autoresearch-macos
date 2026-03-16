@@ -13,6 +13,7 @@ import json
 import os
 import random
 import sys
+import threading
 import webbrowser
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -430,8 +431,33 @@ class SolverState:
                 break
         return snapshots
 
-    def solve_beam(self, beam_width=32, max_steps=100):
-        """Solve with beam search, returning snapshots of the winning path."""
+    def start_beam_search(self, beam_width=32, max_steps=100):
+        """Start beam search in a background thread, updating self.beam_progress."""
+        self.beam_progress = {
+            "status": "running",
+            "step": 0,
+            "max_steps": max_steps,
+            "active_beams": 0,
+            "best_value": 0.0,
+            "states_explored": 0,
+            "best_face_grids": self.get_face_grids(),
+            "best_residual": _cube_residual_error(self.cube),
+            "snapshots": None,
+        }
+
+        def _run():
+            try:
+                snapshots = self._beam_search_inner(beam_width, max_steps)
+                self.beam_progress["status"] = "done"
+                self.beam_progress["snapshots"] = snapshots
+            except Exception as e:
+                self.beam_progress["status"] = "error"
+                self.beam_progress["snapshots"] = []
+
+        self._beam_thread = threading.Thread(target=_run, daemon=True)
+        self._beam_thread.start()
+
+    def _beam_search_inner(self, beam_width, max_steps):
         from prepare import _enumerate_move_candidates, _build_prompt_ids, _autocast_context
         import torch
 
@@ -442,8 +468,8 @@ class SolverState:
             return []
 
         initial_state = self.cube.to_kociemba_string()
-        # Each beam: (cube, history, visited, score, move_trace)
         beams = [(self.cube.copy(), [], {initial_state}, 0.0, [])]
+        total_states = 0
 
         for step in range(max_steps):
             if not beams:
@@ -452,7 +478,6 @@ class SolverState:
             all_candidates = []
             for beam_idx, (b_cube, b_history, b_visited, b_score, b_trace) in enumerate(beams):
                 if b_cube.has_uniform_faces() if b_cube.size == 2 else b_cube.is_solved():
-                    # Winner — reconstruct snapshots
                     return self._trace_to_snapshots(b_trace)
 
                 candidates = _enumerate_move_candidates(
@@ -465,6 +490,8 @@ class SolverState:
 
             if not all_candidates:
                 break
+
+            total_states += len(all_candidates)
 
             # Batch evaluate with value head
             prompt_ids_list = []
@@ -484,7 +511,6 @@ class SolverState:
             with autocast_ctx:
                 values = self.model.predict_value(batch).float()
 
-            # Score and rank
             scored = []
             for i, (beam_idx, c) in enumerate(all_candidates):
                 parent_score = beams[beam_idx][3]
@@ -511,12 +537,27 @@ class SolverState:
 
             beams = new_beams
 
-        # Check final beams for best result
+            # Update progress with best beam's state
+            if beams:
+                best_cube = beams[0][0]
+                best_grids = {}
+                for face in FACE_ORDER:
+                    best_grids[face] = best_cube.face_grid(face)
+                best_val = scored[0][3] if scored else 0
+                self.beam_progress.update({
+                    "step": step + 1,
+                    "active_beams": len(beams),
+                    "best_value": round(best_val, 1),
+                    "states_explored": total_states,
+                    "best_face_grids": best_grids,
+                    "best_residual": _cube_residual_error(best_cube),
+                })
+
+        # Check final beams
         for b_cube, _, _, _, b_trace in beams:
             if b_cube.has_uniform_faces() if b_cube.size == 2 else b_cube.is_solved():
                 return self._trace_to_snapshots(b_trace)
 
-        # No solution — return best beam's trace anyway
         if beams:
             return self._trace_to_snapshots(beams[0][4])
         return []
@@ -1065,38 +1106,71 @@ async function doSolveBeam(){
   badge.className='status-badge solving';badge.textContent='Beam search\u2026';
   const timer=document.getElementById('solve-timer');
   const movesList=document.getElementById('moves-list');
+  movesList.innerHTML='';
   const t0=performance.now();
-  timer.textContent='Running beam search (width=32)\u2026 this may take 1\u20132 min for 3x3';
 
-  const result=await api('solve_beam',{beam_width:32,max_steps:100});
-  const elapsed=((performance.now()-t0)/1000).toFixed(1);
-  const snapshots=result.snapshots;
+  // Start beam search on server
+  await api('solve_beam',{beam_width:32,max_steps:100});
 
-  if(!snapshots.length){
-    timer.textContent='No solution found ('+elapsed+'s)';
-    solving=false;return;
-  }
+  // Poll for progress
+  let done=false;
+  while(!done&&!solveAbort){
+    await new Promise(r=>setTimeout(r,300));
+    const p=await api('beam_status');
+    if(!p)continue;
 
-  const solved=snapshots[snapshots.length-1].solved;
-  timer.textContent=(solved?'\u2705 ':'')+ snapshots.length+' moves in '+elapsed+'s (beam search)';
+    // Update live stats
+    const elapsed=((performance.now()-t0)/1000).toFixed(1);
+    timer.innerHTML=`<b>Step ${p.step||0}/${p.max_steps||100}</b> \u00b7 `+
+      `${p.active_beams||0} beams \u00b7 `+
+      `${p.states_explored||0} states explored \u00b7 `+
+      `dist\u2248${p.best_value||'?'} \u00b7 `+
+      `residual=${p.best_residual!=null?p.best_residual:'?'} \u00b7 `+
+      `${elapsed}s`;
 
-  const replayDelay=parseInt(document.getElementById('speed').value);
-  for(let i=0;i<snapshots.length;i++){
-    if(solveAbort)break;
-    const snap=snapshots[i];
-    updateCube(snap.face_grids);updateStats(snap);
-    const prev=movesList.querySelector('.latest');
-    if(prev)prev.classList.remove('latest');
-    const tag=document.createElement('span');
-    tag.className='move-tag latest';tag.textContent=snap.move;
-    movesList.appendChild(tag);movesList.scrollTop=movesList.scrollHeight;
-    if(replayDelay>0&&i<snapshots.length-1){
-      await new Promise(r=>setTimeout(r,replayDelay));
+    // Show best beam's cube state live
+    if(p.best_face_grids){
+      updateCube(p.best_face_grids);
     }
-  }
-  if(solved){
-    badge.className='status-badge solved';badge.textContent='Solved';
-    document.getElementById('scene').classList.add('solved-glow');
+
+    if(p.status==='done'||p.status==='error'){
+      done=true;
+      const snapshots=p.snapshots||[];
+      if(!snapshots.length){
+        timer.textContent='No solution found ('+elapsed+'s)';
+        solving=false;return;
+      }
+
+      const solved=snapshots[snapshots.length-1].solved;
+      const finalElapsed=((performance.now()-t0)/1000).toFixed(1);
+      timer.textContent=(solved?'\u2705 Solved! ':'')+ snapshots.length+' moves, '+
+        p.states_explored+' states explored in '+finalElapsed+'s';
+
+      // Replay the winning solution
+      // First reset cube display to scrambled state
+      const resetData=await api('reset',{size:cubeSize});
+      // Re-scramble with same scramble (state already has it)
+      // Actually the snapshots already contain the face grids, just replay them
+      const replayDelay=parseInt(document.getElementById('speed').value);
+      for(let i=0;i<snapshots.length;i++){
+        if(solveAbort)break;
+        const snap=snapshots[i];
+        updateCube(snap.face_grids);
+        updateStats(snap);
+        const prev=movesList.querySelector('.latest');
+        if(prev)prev.classList.remove('latest');
+        const tag=document.createElement('span');
+        tag.className='move-tag latest';tag.textContent=snap.move;
+        movesList.appendChild(tag);movesList.scrollTop=movesList.scrollHeight;
+        if(replayDelay>0&&i<snapshots.length-1){
+          await new Promise(r=>setTimeout(r,replayDelay));
+        }
+      }
+      if(solved){
+        badge.className='status-badge solved';badge.textContent='Solved';
+        document.getElementById('scene').classList.add('solved-glow');
+      }
+    }
   }
   solving=false;
 }
@@ -1183,11 +1257,19 @@ class PlaygroundHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/solve_beam':
             beam_width = body.get('beam_width', 32)
             max_steps = body.get('max_steps', 100)
-            snapshots = state.solve_beam(beam_width=beam_width, max_steps=max_steps)
-            result = {
-                "snapshots": snapshots,
-                "final": state.to_json(),
-            }
+            state.start_beam_search(beam_width=beam_width, max_steps=max_steps)
+            result = {"status": "started"}
+
+        elif self.path == '/api/beam_status':
+            p = getattr(state, 'beam_progress', None)
+            if p is None:
+                result = {"status": "idle"}
+            else:
+                result = dict(p)
+                # Don't send snapshots until done (too large)
+                if result["status"] != "done":
+                    result.pop("snapshots", None)
+                result["final"] = state.to_json()
 
         elif self.path == '/api/reset':
             size = body.get('size', state.cube_size)
