@@ -430,6 +430,123 @@ class SolverState:
                 break
         return snapshots
 
+    def solve_beam(self, beam_width=32, max_steps=100):
+        """Solve with beam search, returning snapshots of the winning path."""
+        from prepare import _enumerate_move_candidates, _build_prompt_ids, _autocast_context
+        import torch
+
+        device = next(self.model.parameters()).device
+        autocast_ctx = _autocast_context(device.type)
+
+        if self.is_goal():
+            return []
+
+        initial_state = self.cube.to_kociemba_string()
+        # Each beam: (cube, history, visited, score, move_trace)
+        beams = [(self.cube.copy(), [], {initial_state}, 0.0, [])]
+
+        for step in range(max_steps):
+            if not beams:
+                break
+
+            all_candidates = []
+            for beam_idx, (b_cube, b_history, b_visited, b_score, b_trace) in enumerate(beams):
+                if b_cube.has_uniform_faces() if b_cube.size == 2 else b_cube.is_solved():
+                    # Winner — reconstruct snapshots
+                    return self._trace_to_snapshots(b_trace)
+
+                candidates = _enumerate_move_candidates(
+                    self.model, self.tokenizer, b_cube, b_history, b_visited)
+                for c in candidates:
+                    if c["is_goal"]:
+                        trace = b_trace + [c["move"]]
+                        return self._trace_to_snapshots(trace)
+                    all_candidates.append((beam_idx, c))
+
+            if not all_candidates:
+                break
+
+            # Batch evaluate with value head
+            prompt_ids_list = []
+            for beam_idx, c in all_candidates:
+                b_history = beams[beam_idx][1]
+                next_history = [*b_history, c["move"]]
+                ids = _build_prompt_ids(self.tokenizer, c["next_cube"], next_history)
+                prompt_ids_list.append(ids)
+
+            max_len = max(len(ids) for ids in prompt_ids_list)
+            pad_id = self.tokenizer.get_pad_token_id()
+            batch = torch.full((len(prompt_ids_list), max_len), pad_id,
+                               dtype=torch.long, device=device)
+            for i, ids in enumerate(prompt_ids_list):
+                batch[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+            with autocast_ctx:
+                values = self.model.predict_value(batch).float()
+
+            # Score and rank
+            scored = []
+            for i, (beam_idx, c) in enumerate(all_candidates):
+                parent_score = beams[beam_idx][3]
+                candidate_score = parent_score + c["score"] - 0.5 * values[i].item()
+                scored.append((candidate_score, beam_idx, c, values[i].item()))
+
+            scored.sort(key=lambda x: -x[0])
+            new_beams = []
+            seen_states = set()
+            for score, beam_idx, c, val in scored:
+                if len(new_beams) >= beam_width:
+                    break
+                state_str = c["next_state_str"]
+                if state_str in seen_states:
+                    continue
+                seen_states.add(state_str)
+
+                parent = beams[beam_idx]
+                new_history = [*parent[1], c["move"]]
+                new_visited = set(parent[2])
+                new_visited.add(state_str)
+                new_trace = parent[4] + [c["move"]]
+                new_beams.append((c["next_cube"], new_history, new_visited, score, new_trace))
+
+            beams = new_beams
+
+        # Check final beams for best result
+        for b_cube, _, _, _, b_trace in beams:
+            if b_cube.has_uniform_faces() if b_cube.size == 2 else b_cube.is_solved():
+                return self._trace_to_snapshots(b_trace)
+
+        # No solution — return best beam's trace anyway
+        if beams:
+            return self._trace_to_snapshots(beams[0][4])
+        return []
+
+    def _trace_to_snapshots(self, moves):
+        """Replay a move trace on the cube and return snapshots."""
+        # Reset cube to scrambled state
+        self.cube = Cube(self.cube_size)
+        self.cube.apply_moves(self.scramble_moves)
+        self.history = []
+        self.visited = {self.cube.to_kociemba_string()}
+        self.solve_moves = []
+
+        snapshots = []
+        for move in moves:
+            self.cube.apply_move(move)
+            self.history.append(move)
+            self.visited.add(self.cube.to_kociemba_string())
+            self.solve_moves.append(move)
+            snapshots.append({
+                "move": f"{move.face} {move.turn_name()}",
+                "face_grids": self.get_face_grids(),
+                "solved": self.is_goal(),
+                "step_count": len(self.solve_moves),
+                "residual": _cube_residual_error(self.cube),
+            })
+            if self.is_goal():
+                break
+        return snapshots
+
     def get_face_grids(self):
         grids = {}
         for face in FACE_ORDER:
@@ -757,7 +874,8 @@ header p{color:var(--text-dim);font-size:0.82rem;letter-spacing:0.04em;font-weig
         <span class="slider-val" id="scramble-depth-val">14</span>
       </div>
       <button class="btn btn-scramble" id="btn-scramble" onclick="doScramble()">Scramble</button>
-      <button class="btn btn-solve" id="btn-solve" onclick="doSolveRealtime()" disabled>Solve (real-time)</button>
+      <button class="btn btn-solve" id="btn-solve" onclick="doSolveRealtime()" disabled>Solve (fast)</button>
+      <button class="btn btn-solve" id="btn-beam" onclick="doSolveBeam()" disabled style="background:var(--blue)">Solve (thorough)</button>
       <button class="btn btn-reset" onclick="doReset()">Reset</button>
       <div class="slider-row">
         <label>Replay</label>
@@ -876,6 +994,7 @@ async function setSize(n){
   document.getElementById('moves-list').innerHTML='';
   document.getElementById('solve-timer').textContent='';
   document.getElementById('btn-solve').disabled=true;
+  document.getElementById('btn-beam').disabled=true;
 }
 
 async function doScramble(){
@@ -887,6 +1006,7 @@ async function doScramble(){
   document.getElementById('moves-list').innerHTML='';
   document.getElementById('solve-timer').textContent='';
   document.getElementById('btn-solve').disabled=false;
+  document.getElementById('btn-beam').disabled=false;
 }
 
 async function doSolveRealtime(){
@@ -937,6 +1057,50 @@ async function doSolveRealtime(){
   solving=false;
 }
 
+async function doSolveBeam(){
+  if(solving)return;solving=true;solveAbort=false;
+  document.getElementById('btn-solve').disabled=true;
+  document.getElementById('btn-beam').disabled=true;
+  const badge=document.getElementById('status');
+  badge.className='status-badge solving';badge.textContent='Beam search\u2026';
+  const timer=document.getElementById('solve-timer');
+  const movesList=document.getElementById('moves-list');
+  const t0=performance.now();
+  timer.textContent='Running beam search (width=32)\u2026 this may take 1\u20132 min for 3x3';
+
+  const result=await api('solve_beam',{beam_width:32,max_steps:100});
+  const elapsed=((performance.now()-t0)/1000).toFixed(1);
+  const snapshots=result.snapshots;
+
+  if(!snapshots.length){
+    timer.textContent='No solution found ('+elapsed+'s)';
+    solving=false;return;
+  }
+
+  const solved=snapshots[snapshots.length-1].solved;
+  timer.textContent=(solved?'\u2705 ':'')+ snapshots.length+' moves in '+elapsed+'s (beam search)';
+
+  const replayDelay=parseInt(document.getElementById('speed').value);
+  for(let i=0;i<snapshots.length;i++){
+    if(solveAbort)break;
+    const snap=snapshots[i];
+    updateCube(snap.face_grids);updateStats(snap);
+    const prev=movesList.querySelector('.latest');
+    if(prev)prev.classList.remove('latest');
+    const tag=document.createElement('span');
+    tag.className='move-tag latest';tag.textContent=snap.move;
+    movesList.appendChild(tag);movesList.scrollTop=movesList.scrollHeight;
+    if(replayDelay>0&&i<snapshots.length-1){
+      await new Promise(r=>setTimeout(r,replayDelay));
+    }
+  }
+  if(solved){
+    badge.className='status-badge solved';badge.textContent='Solved';
+    document.getElementById('scene').classList.add('solved-glow');
+  }
+  solving=false;
+}
+
 async function doReset(){
   solveAbort=true;solving=false;
   const data=await api('reset',{size:cubeSize});
@@ -944,6 +1108,7 @@ async function doReset(){
   document.getElementById('moves-list').innerHTML='';
   document.getElementById('solve-timer').textContent='';
   document.getElementById('btn-solve').disabled=true;
+  document.getElementById('btn-beam').disabled=true;
 }
 
 document.getElementById('speed').addEventListener('input',e=>{
@@ -1010,6 +1175,15 @@ class PlaygroundHandler(BaseHTTPRequestHandler):
 
         elif self.path == '/api/solve_all':
             snapshots = state.solve_all()
+            result = {
+                "snapshots": snapshots,
+                "final": state.to_json(),
+            }
+
+        elif self.path == '/api/solve_beam':
+            beam_width = body.get('beam_width', 32)
+            max_steps = body.get('max_steps', 100)
+            snapshots = state.solve_beam(beam_width=beam_width, max_steps=max_steps)
             result = {
                 "snapshots": snapshots,
                 "final": state.to_json(),
