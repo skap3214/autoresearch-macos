@@ -50,25 +50,37 @@ def _parse_basic_step(step: str) -> Move:
     return Move(face=face, depth=1, width=1, turns=turns)
 
 
+def _solve_cube(cube: Cube, solver_class, goal_check) -> tuple[Move, ...]:
+    """Generic solver: instantiate solver_class, solve, parse, verify."""
+    if goal_check(cube):
+        return ()
+
+    _ensure_solver_importable()
+
+    state = cube.to_kociemba_string()
+    solver_cube = solver_class(state, "URFDLB", None)
+    solver_cube.solve([])
+    raw_steps = [s for s in solver_cube.solution if not s.startswith("COMMENT")]
+    solution = tuple(_parse_basic_step(step) for step in raw_steps)
+
+    check_cube = cube.copy()
+    check_cube.apply_moves(solution)
+    if not goal_check(check_cube):
+        raise RuntimeError("Teacher solution did not solve cube in local simulator")
+    return solution
+
+
 def solve_cube_222(cube: Cube) -> tuple[Move, ...]:
     if cube.size != 2:
         raise ValueError(f"solve_cube_222 only supports 2x2, got {cube.size}")
 
-    # Short-circuit: already solved cubes hang the dwalton solver
-    if cube.has_uniform_faces():
-        return ()
-
-    _ensure_solver_importable()
     from rubikscubennnsolver.RubiksCube222 import RubiksCube222
+    return _solve_cube(cube, RubiksCube222, lambda c: c.has_uniform_faces())
 
-    state = cube.to_kociemba_string()
-    solver_cube = RubiksCube222(state, "URFDLB", None)
-    solver_cube.solve([])
-    solution = tuple(_parse_basic_step(step) for step in solver_cube.solution)
 
-    # Verify the move trace solves our simulator state before using it as a label.
-    check_cube = cube.copy()
-    check_cube.apply_moves(solution)
-    if not check_cube.has_uniform_faces():
-        raise RuntimeError("Teacher solution did not solve cube in local simulator")
-    return solution
+def solve_cube_333(cube: Cube) -> tuple[Move, ...]:
+    if cube.size != 3:
+        raise ValueError(f"solve_cube_333 only supports 3x3, got {cube.size}")
+
+    from rubikscubennnsolver.RubiksCube333 import RubiksCube333
+    return _solve_cube(cube, RubiksCube333, lambda c: c.is_solved())

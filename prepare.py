@@ -35,23 +35,24 @@ from rubiks import (
     random_scramble,
     scramble_length_for_size,
 )
-from teacher_dwalton import solve_cube_222
+from teacher_dwalton import solve_cube_222, solve_cube_333
 
 # ---------------------------------------------------------------------------
 # Constants (fixed for v1)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 48
-TIME_BUDGET = 3600
+MAX_SEQ_LEN = 72
+TIME_BUDGET = 10800
 TEACHER_BACKEND = "dwalton76/rubiks-cube-NxNxN-solver"
 PROMPT_FORMAT_VERSION = "flat24-history3-jointmove-v1"
 
-TRAIN_SIZES = (2,)
+TRAIN_SIZES = (2, 3)
 ID_VAL_SIZES = TRAIN_SIZES
 OOD_DEV_SIZES = ()
 OOD_TEST_SIZES = ()
 
-TRAIN_EPISODES_PER_SIZE = 65536
+TRAIN_EPISODES_PER_SIZE = 65536  # balanced 1:1 ratio
+_TRAIN_EPISODES_OVERRIDE = {}  # no override, use TRAIN_EPISODES_PER_SIZE for all sizes
 ID_VAL_EPISODES_PER_SIZE = 256
 OOD_DEV_EPISODES_PER_SIZE = 0
 OOD_TEST_EPISODES_PER_SIZE = 0
@@ -63,10 +64,10 @@ MAX_GENERATION_TOKENS = 20
 TRAIN_RNG_SEED = 42
 VAL_RNG_SEED = 99
 TRAIN_USE_CURRICULUM = False
-TRAIN_CURRICULUM_SCRAMBLE_LENGTHS = (2, 4, 6, 8, 10, 14)
+TRAIN_CURRICULUM_SCRAMBLE_LENGTHS = (2, 4, 6, 8, 10, 14, 18)
 
 ROLLOUT_MIN_STEPS = 200
-SEARCH_SELECTOR = "hybrid_greedy_v1"
+SEARCH_SELECTOR = "hybrid_greedy_v1"  # fast eval; value-guided tested post-hoc
 SEARCH_RESIDUAL_DELTA = 2
 SEARCH_LOOKAHEAD_TOP_K = 3
 SEARCH_SECOND_SCORE_DISCOUNT = 0.5
@@ -309,6 +310,17 @@ def episode_to_examples(tokenizer: Tokenizer, episode: Episode) -> list[dict[str
     return examples
 
 
+def _generate_one_worker(args):
+    """Module-level worker for parallel episode generation."""
+    import sys
+    solver_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rubiks-cube-NxNxN-solver")
+    if os.path.exists(solver_root) and solver_root not in sys.path:
+        sys.path.insert(0, solver_root)
+    size, seed, scramble_length = args
+    worker_rng = random.Random(seed)
+    return generate_teacher_episode(size=size, rng=worker_rng, scramble_length=scramble_length)
+
+
 def generate_teacher_episode(size: int, rng: random.Random, scramble_length: int | None = None) -> Episode:
     if scramble_length is None:
         scramble_length = scramble_length_for_size(size)
@@ -324,6 +336,8 @@ def generate_teacher_episode(size: int, rng: random.Random, scramble_length: int
 
     if size == 2:
         solution = solve_cube_222(cube)
+    elif size == 3:
+        solution = solve_cube_333(cube)
     else:
         raise NotImplementedError(f"Teacher backend is not integrated for size {size} yet")
 
@@ -427,16 +441,23 @@ def build_dataset_payload(force: bool = False):
     }
 
     def generate_episode_batch(size: int, count: int, rng: random.Random, curriculum: bool = False) -> list[Episode]:
-        episodes = []
+        from multiprocessing import Pool, cpu_count
+        args = []
         for _ in range(count):
             sl = rng.choice(TRAIN_CURRICULUM_SCRAMBLE_LENGTHS) if curriculum else None
-            episodes.append(generate_teacher_episode(size=size, rng=rng, scramble_length=sl))
+            seed = rng.randint(0, 2**31)
+            args.append((size, seed, sl))
+        n_workers = min(cpu_count(), 16)
+        print(f"  Generating {count} episodes for size {size} with {n_workers} workers...")
+        with Pool(n_workers) as pool:
+            episodes = pool.map(_generate_one_worker, args, chunksize=max(1, count // (n_workers * 4)))
         return episodes
 
     for size in TRAIN_SIZES:
+        n_episodes = _TRAIN_EPISODES_OVERRIDE.get(size, TRAIN_EPISODES_PER_SIZE)
         episodes = generate_episode_batch(
             size,
-            TRAIN_EPISODES_PER_SIZE,
+            n_episodes,
             rng=train_rng,
             curriculum=TRAIN_USE_CURRICULUM,
         )
@@ -681,6 +702,7 @@ def _enumerate_move_candidates(
             if next_state_str in visited_states:
                 continue
 
+            is_goal = next_cube.has_uniform_faces() if cube.size == 2 else next_cube.is_solved()
             candidates.append(
                 {
                     "move": move,
@@ -688,7 +710,7 @@ def _enumerate_move_candidates(
                     "residual": _cube_residual_error(next_cube),
                     "next_cube": next_cube,
                     "next_state_str": next_state_str,
-                    "is_goal": next_cube.has_uniform_faces(),
+                    "is_goal": is_goal,
                 }
             )
     return candidates
@@ -807,6 +829,75 @@ def _select_move_two_ply(
 
 
 @torch.no_grad()
+def _select_move_value_guided(
+    model,
+    tokenizer: Tokenizer,
+    cube: Cube,
+    history: list[Move],
+    visited_states: set[str],
+) -> Move | None:
+    """Select move using value head to evaluate candidate next-states.
+    Combines residual filtering (for 2x2) with value-guided ranking."""
+    candidates = _enumerate_move_candidates(model, tokenizer, cube, history, visited_states)
+    if not candidates:
+        return None
+
+    # Immediate goal check
+    for c in candidates:
+        if c["is_goal"]:
+            return c["move"]
+
+    # Apply residual filter only for 2x2 (helps 2x2, hurts 3x3 value guidance)
+    if cube.size == 2:
+        current_residual = _cube_residual_error(cube)
+        acceptable = [c for c in candidates if c["residual"] <= current_residual + SEARCH_RESIDUAL_DELTA]
+        pool = acceptable if acceptable else candidates
+    else:
+        pool = candidates
+
+    # If only one candidate after filtering, just use it
+    if len(pool) == 1:
+        return pool[0]["move"]
+
+    device = next(model.parameters()).device
+    autocast_ctx = _autocast_context(device.type)
+
+    # Batch-evaluate candidate next-states with value head
+    prompt_ids_list = []
+    for c in pool:
+        next_history = [*history, c["move"]]
+        ids = _build_prompt_ids(tokenizer, c["next_cube"], next_history)
+        prompt_ids_list.append(ids)
+
+    max_len = max(len(ids) for ids in prompt_ids_list)
+    pad_id = tokenizer.get_pad_token_id()
+    batch = torch.full((len(prompt_ids_list), max_len), pad_id, dtype=torch.long, device=device)
+    for i, ids in enumerate(prompt_ids_list):
+        batch[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+    with autocast_ctx:
+        values = model.predict_value(batch).float()  # (N,) predicted distance-to-goal
+
+    # Blend policy score and value prediction
+    policy_scores = torch.tensor([c["score"] for c in pool], device=device)
+    policy_probs = torch.softmax(policy_scores, dim=0)
+
+    # Lower value = closer to goal = better
+    alpha = 0.3  # policy weight (value-dominant)
+    value_scores = -values
+    if value_scores.std() > 1e-6:
+        value_scores = (value_scores - value_scores.mean()) / value_scores.std()
+    if policy_probs.std() > 1e-6:
+        policy_norm = (policy_probs - policy_probs.mean()) / policy_probs.std()
+    else:
+        policy_norm = policy_probs
+    combined = alpha * policy_norm + (1 - alpha) * value_scores
+
+    best_idx = combined.argmax().item()
+    return pool[best_idx]["move"]
+
+
+@torch.no_grad()
 def _select_move_with_search(
     model,
     tokenizer: Tokenizer,
@@ -818,6 +909,13 @@ def _select_move_with_search(
         return _select_move_greedy(model, tokenizer, cube, history, visited_states)
     if SEARCH_SELECTOR == "two_ply_v1":
         return _select_move_two_ply(model, tokenizer, cube, history, visited_states)
+    if SEARCH_SELECTOR == "value_guided_v1":
+        return _select_move_value_guided(model, tokenizer, cube, history, visited_states)
+    if SEARCH_SELECTOR == "hybrid_auto_v1":
+        # Best search per size: greedy+residual for 2x2, value-guided for 3x3+
+        if cube.size == 2:
+            return _select_move_greedy(model, tokenizer, cube, history, visited_states)
+        return _select_move_value_guided(model, tokenizer, cube, history, visited_states)
     raise ValueError(f"Unsupported search selector: {SEARCH_SELECTOR}")
 
 
@@ -834,6 +932,92 @@ def _cube_residual_error(cube: Cube) -> int:
         most_common_count = Counter(colors).most_common(1)[0][1]
         error += len(colors) - most_common_count
     return error
+
+
+@torch.no_grad()
+def _beam_search_solve(model, tokenizer: Tokenizer, cube: Cube, beam_width: int = 8, max_steps: int = 200) -> bool:
+    """Beam search rollout: keep multiple partial solutions, expand the most promising."""
+    device = next(model.parameters()).device
+    autocast_ctx = _autocast_context(device.type)
+
+    def is_goal(c):
+        return c.has_uniform_faces() if c.size == 2 else c.is_solved()
+
+    if is_goal(cube):
+        return True
+
+    # Each beam: (cube, history, visited, cumulative_value_score)
+    initial_state = cube.to_kociemba_string()
+    beams = [(cube.copy(), [], {initial_state}, 0.0)]
+
+    for step in range(max_steps):
+        if not beams:
+            break
+
+        all_candidates = []
+        for beam_idx, (b_cube, b_history, b_visited, b_score) in enumerate(beams):
+            if is_goal(b_cube):
+                return True
+
+            candidates = _enumerate_move_candidates(model, tokenizer, b_cube, b_history, b_visited)
+            for c in candidates:
+                if c["is_goal"]:
+                    return True
+                all_candidates.append((beam_idx, c))
+
+        if not all_candidates:
+            break
+
+        # Batch evaluate all candidate next-states with value head
+        prompt_ids_list = []
+        for beam_idx, c in all_candidates:
+            b_history = beams[beam_idx][1]
+            next_history = [*b_history, c["move"]]
+            ids = _build_prompt_ids(tokenizer, c["next_cube"], next_history)
+            prompt_ids_list.append(ids)
+
+        max_len = max(len(ids) for ids in prompt_ids_list)
+        pad_id = tokenizer.get_pad_token_id()
+        batch = torch.full((len(prompt_ids_list), max_len), pad_id, dtype=torch.long, device=device)
+        for i, ids in enumerate(prompt_ids_list):
+            batch[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+        with autocast_ctx:
+            values = model.predict_value(batch).float()
+
+        # Score: blend policy logit + negative value (lower distance = better)
+        scored = []
+        for i, (beam_idx, c) in enumerate(all_candidates):
+            parent_score = beams[beam_idx][3]
+            # Value = predicted distance to goal (lower is better)
+            candidate_score = parent_score + c["score"] - 0.5 * values[i].item()
+            scored.append((candidate_score, beam_idx, c, values[i].item()))
+
+        # Keep top beam_width candidates
+        scored.sort(key=lambda x: -x[0])  # highest score first
+        new_beams = []
+        seen_states = set()
+        for score, beam_idx, c, val in scored:
+            if len(new_beams) >= beam_width:
+                break
+            state_str = c["next_state_str"]
+            if state_str in seen_states:
+                continue
+            seen_states.add(state_str)
+
+            parent = beams[beam_idx]
+            new_history = [*parent[1], c["move"]]
+            new_visited = set(parent[2])
+            new_visited.add(state_str)
+            new_beams.append((c["next_cube"], new_history, new_visited, score))
+
+        beams = new_beams
+
+    # Check final beams
+    for b_cube, _, _, _ in beams:
+        if is_goal(b_cube):
+            return True
+    return False
 
 
 @torch.no_grad()

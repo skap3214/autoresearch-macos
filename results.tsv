@@ -49,4 +49,16 @@ ep6k	0.179688	0.605505	0.179688	8.21	4382	discard	TRAIN_EPISODES=6144 — 46/256
 t1200	0.175781	0.605922	0.175781	8.72	17401	discard	TIME_BUDGET=1200 (20min) — 45/256, overfitted same data (loss=0.27 but no generalization gain)
 t1200e8k	0.402344	0.679733	0.402344	5.95	19660	keep	BEST: TIME_BUDGET=1200 + 8192 episodes — 103/256 solved (40.2%)! more data+time wins
 d8gpu	0.933594	0.825688	0.933594	-	50078	keep	D=8 dim=512 25.4M params + 32K episodes + TIME_BUDGET=3600 + RTX 5090 — 239/256 solved (93.4%)
-d8e64k	1.000000	0.839867	1.000000	-	51547	keep	BEST: D=8 + 64K episodes + ROLLOUT_MIN_STEPS=200 — 256/256 solved (100%)!
+d8e64k	1.000000	0.839867	1.000000	-	51547	keep	BEST 2x2: D=8 + 64K episodes + ROLLOUT_MIN_STEPS=200 — 256/256 solved (100%)!
+d12joint	0.357422	0.705205	0.357422	-	42960	keep	D=12 85.4M 2x2+3x3 joint 32K/size — 2x2:68% 3x3:4% (first 3x3 solves!)
+d12v2	0.404297	0.743067	0.404297	-	43333	keep	D=12 85.4M 2x2+3x3 65K/size 1hr — 2x2:75% 3x3:6%
+d12v3	0.515625	0.738888	0.515625	-	86668	keep	BEST joint: D=12 85.4M 2x2+3x3 65K/size 2hr — 2x2:95% 3x3:8%
+d16v1	0.464844	0.756616	0.464844	-	39652	discard	D=16 202M 2hr — 2x2:88% 3x3:5% (underfitting, too few steps)
+d12v4	0.460938	0.730784	0.460938	-	129827	keep	D=12 3hr 32K 2x2 + 131K 3x3 (4:1 ratio) — 2x2:80% 3x3:12%
+d12v5	0.535156	-	0.535156	-	113999	keep	BEST joint: D=12 3hr 65K/size balanced — greedy: 2x2:97% 3x3:10% | value-guided: 2x2:83% 3x3:20%
+d12cur	0.312500	0.695707	0.312500	-	129836	discard	D=12 3hr curriculum [2,4,6,8,10,14,18] — 2x2:62% 3x3:0% (curriculum hurt, too many easy examples)
+d12v6	0.501953	0.735722	0.501953	-	129599	keep	D=12 3hr value_weight=0.8 greedy — 2x2:96% 3x3:5% (higher value weight hurt 3x3 policy)
+d12v7	0.501953	0.735700	0.501953	-	129599	keep	D=12 3hr 65K/size val_w=0.5 — greedy: 2x2:96% 3x3:5% | beam(w=8): 3x3:62.5% on 32-cube subset!
+d12v5+beam	-	-	-	-	-	keep	d12v5 model + beam search (width=8) — 3x3:56% on 32-cube subset
+d12v7+beam	-	-	-	-	-	keep	BEST 3x3: beam w=8: 3x3:55.5% (142/256 full) | w=16: 67.2% (64 subset) | greedy 2x2:96%
+d12v5+beam32	-	-	-	-	-	keep	BEST OVERALL: d12v5 + beam search (w=32) — 2x2:90% 3x3:70% combined:80% on full 256/size eval\!

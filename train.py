@@ -624,11 +624,11 @@ ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention (4 heads for more diverse patterns)
 WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 
-# Sequence length for training (flat state + up to 3 history moves + 1-token answer ≈ 34 tokens)
-TRAIN_SEQ_LEN = 36
+# Sequence length for training (3x3: 54 stickers + 5 markers + 3 history + 1 answer ≈ 63 tokens)
+TRAIN_SEQ_LEN = 64
 
 # Optimization
-TOTAL_BATCH_SIZE = 18432  # = 512 * 36, one microstep per optimizer step
+TOTAL_BATCH_SIZE = 16384  # = 256 * 64, one microstep per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.12        # learning rate for matrix parameters (Muon)
@@ -640,8 +640,8 @@ WARMDOWN_RATIO = 0.15   # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 512  # per-device batch size (reduce if OOM)
+DEPTH = 12              # number of transformer layers (sweet spot for 2hr budget)
+DEVICE_BATCH_SIZE = 256  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -814,9 +814,9 @@ def get_weight_decay(progress):
 # DAgger: mid-training on-policy data collection
 # ---------------------------------------------------------------------------
 
-DAGGER_TRIGGER_FRACS = [0.5]  # single DAgger round at midpoint
+DAGGER_TRIGGER_FRACS = []  # disabled — not producing useful data for 3x3 yet
 DAGGER_NUM_EPISODES = 200   # rollouts to collect
-DAGGER_MAX_STEPS = 15       # steps per rollout
+DAGGER_MAX_STEPS = 25       # steps per rollout (longer for 3x3)
 
 from prepare import (
     _select_move_with_search,
@@ -825,8 +825,20 @@ from prepare import (
     get_runtime_device,
 )
 from rubiks import Cube, build_prompt_tokens, build_answer_tokens, random_scramble, scramble_length_for_size
-from teacher_dwalton import solve_cube_222
+from teacher_dwalton import solve_cube_222, solve_cube_333
 import random as _random
+
+DAGGER_TRAIN_SIZES = (2, 3)
+
+def _solve_cube_any(cube):
+    if cube.size == 2:
+        return solve_cube_222(cube)
+    elif cube.size == 3:
+        return solve_cube_333(cube)
+    raise NotImplementedError(f"No solver for size {cube.size}")
+
+def _is_goal(cube):
+    return cube.has_uniform_faces() if cube.size == 2 else cube.is_solved()
 
 
 def collect_dagger_data(model, tokenizer, num_episodes=DAGGER_NUM_EPISODES,
@@ -834,40 +846,42 @@ def collect_dagger_data(model, tokenizer, num_episodes=DAGGER_NUM_EPISODES,
     """Roll out the current policy and collect teacher corrections at visited states."""
     rng = _random.Random(int(time.time()))  # different data each run
     examples = []
-    for _ in range(num_episodes):
-        scramble = random_scramble(size=2, length=scramble_length_for_size(2), rng=rng)
-        cube = Cube(2)
-        cube.apply_moves(scramble)
-        history = []
-        visited = {cube.to_kociemba_string()}
+    episodes_per_size = max(1, num_episodes // len(DAGGER_TRAIN_SIZES))
+    for size in DAGGER_TRAIN_SIZES:
+        for _ in range(episodes_per_size):
+            scramble = random_scramble(size=size, length=scramble_length_for_size(size), rng=rng)
+            cube = Cube(size)
+            cube.apply_moves(scramble)
+            history = []
+            visited = {cube.to_kociemba_string()}
 
-        for _ in range(max_steps):
-            if cube.has_uniform_faces():
-                break
+            for _ in range(max_steps):
+                if _is_goal(cube):
+                    break
 
-            # Get teacher correction at this on-policy state
-            try:
-                teacher_solution = solve_cube_222(cube)
-                if teacher_solution:
-                    prompt_tokens = build_prompt_tokens(2, cube, history=history)
-                    answer_tokens = build_answer_tokens(teacher_solution[0])
-                    encoded = encode_supervised_example(tokenizer, prompt_tokens, answer_tokens)
-                    encoded["size"] = 2
-                    encoded["distance_to_goal"] = len(teacher_solution)
-                    examples.append(encoded)
-            except Exception:
-                pass
+                # Get teacher correction at this on-policy state
+                try:
+                    teacher_solution = _solve_cube_any(cube)
+                    if teacher_solution:
+                        prompt_tokens = build_prompt_tokens(size, cube, history=history)
+                        answer_tokens = build_answer_tokens(teacher_solution[0])
+                        encoded = encode_supervised_example(tokenizer, prompt_tokens, answer_tokens)
+                        encoded["size"] = size
+                        encoded["distance_to_goal"] = len(teacher_solution)
+                        examples.append(encoded)
+                except Exception:
+                    pass
 
-            # Follow the MODEL's policy (not teacher's) to visit on-policy states
-            move = _select_move_with_search(model, tokenizer, cube, history, visited)
-            if move is None:
-                break
-            try:
-                cube.apply_move(move)
-            except Exception:
-                break
-            history.append(move)
-            visited.add(cube.to_kociemba_string())
+                # Follow the MODEL's policy (not teacher's) to visit on-policy states
+                move = _select_move_with_search(model, tokenizer, cube, history, visited)
+                if move is None:
+                    break
+                try:
+                    cube.apply_move(move)
+                except Exception:
+                    break
+                history.append(move)
+                visited.add(cube.to_kociemba_string())
 
     return examples
 
