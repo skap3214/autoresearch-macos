@@ -356,30 +356,38 @@ class SolverState:
         self.model = model
         self.tokenizer = tokenizer
         self.rng = random.Random()
+        self.cube_size = 2
         self.reset()
 
-    def reset(self):
-        self.cube = Cube(2)
+    def reset(self, size=None):
+        if size is not None:
+            self.cube_size = size
+        self.cube = Cube(self.cube_size)
         self.history = []
         self.visited = set()
         self.visited.add(self.cube.to_kociemba_string())
         self.scramble_moves = []
         self.solve_moves = []
-        self.solving = False
 
-    def scramble(self, length=14):
-        self.reset()
+    def is_goal(self):
+        if self.cube_size == 2:
+            return self.cube.has_uniform_faces()
+        return self.cube.is_solved()
+
+    def scramble(self, length=14, size=None):
+        self.reset(size=size)
+        max_d = min(2, self.cube_size // 2) if self.cube_size <= 3 else 2
+        max_w = min(2, self.cube_size // 2) if self.cube_size <= 3 else 2
         self.scramble_moves = list(random_scramble(
-            size=2, length=length, rng=self.rng,
-            max_depth=2, max_width=2,
+            size=self.cube_size, length=length, rng=self.rng,
+            max_depth=max_d, max_width=max_w,
         ))
         self.cube.apply_moves(self.scramble_moves)
         self.visited = {self.cube.to_kociemba_string()}
-        self.solving = False
         self.solve_moves = []
 
     def step(self):
-        if self.cube.has_uniform_faces():
+        if self.is_goal():
             return None, True
 
         move = select_move(
@@ -393,8 +401,34 @@ class SolverState:
         self.history.append(move)
         self.visited.add(self.cube.to_kociemba_string())
         self.solve_moves.append(move)
-        solved = self.cube.has_uniform_faces()
-        return move, solved
+        return move, self.is_goal()
+
+    def solve_all(self):
+        """Solve greedily, returning all (move, face_grids) snapshots for replay."""
+        snapshots = []
+        for _ in range(ROLLOUT_MIN_STEPS):
+            if self.is_goal():
+                break
+            move = select_move(
+                self.model, self.tokenizer,
+                self.cube, self.history, self.visited,
+            )
+            if move is None:
+                break
+            self.cube.apply_move(move)
+            self.history.append(move)
+            self.visited.add(self.cube.to_kociemba_string())
+            self.solve_moves.append(move)
+            snapshots.append({
+                "move": f"{move.face} {move.turn_name()}",
+                "face_grids": self.get_face_grids(),
+                "solved": self.is_goal(),
+                "step_count": len(self.solve_moves),
+                "residual": _cube_residual_error(self.cube),
+            })
+            if self.is_goal():
+                break
+        return snapshots
 
     def get_face_grids(self):
         grids = {}
@@ -405,10 +439,11 @@ class SolverState:
     def to_json(self):
         return {
             "face_grids": self.get_face_grids(),
-            "solved": self.cube.has_uniform_faces(),
+            "solved": self.is_goal(),
             "step_count": len(self.solve_moves),
             "residual": _cube_residual_error(self.cube),
             "scramble_length": len(self.scramble_moves),
+            "cube_size": self.cube_size,
         }
 
 
@@ -421,505 +456,518 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>2x2 Rubik's Cube Neural Solver</title>
+<title>Neural Cube Solver</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=JetBrains+Mono:wght@400;600&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-    background: #0f0f1a;
-    color: #e0e0e0;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 30px 20px;
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#060608;--surface:#0e0e14;--border:#1a1a28;
+  --text:#c8c5d0;--text-dim:#5a5872;--text-bright:#f0eef5;
+  --amber:#e8a830;--amber-dim:#7a5a1a;--amber-glow:rgba(232,168,48,0.12);
+  --green:#3dd68c;--green-dim:#1a4a32;
+  --red:#e85050;
+  --blue:#5088e8;
+  --radius:10px;
 }
-h1 {
-    font-size: 28px;
-    font-weight: 700;
-    background: linear-gradient(135deg, #4fc3f7, #7c4dff);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    margin-bottom: 4px;
+html{font-size:15px}
+body{
+  font-family:'Outfit',sans-serif;font-weight:400;
+  background:var(--bg);color:var(--text);
+  min-height:100vh;overflow-x:hidden;
+  background-image:
+    radial-gradient(ellipse 80% 60% at 50% 0%,rgba(232,168,48,0.04),transparent),
+    radial-gradient(ellipse 60% 40% at 80% 100%,rgba(80,136,232,0.03),transparent);
 }
-.subtitle { color: #888; font-size: 14px; margin-bottom: 30px; }
+.container{
+  max-width:960px;margin:0 auto;padding:48px 24px 64px;
+  display:flex;flex-direction:column;align-items:center;
+}
 
-.main {
-    display: flex;
-    gap: 40px;
-    align-items: flex-start;
-    flex-wrap: wrap;
-    justify-content: center;
+/* Header */
+header{text-align:center;margin-bottom:48px}
+header h1{
+  font-family:'DM Serif Display',serif;font-size:2.6rem;font-weight:400;
+  color:var(--text-bright);letter-spacing:-0.02em;line-height:1.1;
+  margin-bottom:8px;
 }
+header h1 span{color:var(--amber)}
+header p{color:var(--text-dim);font-size:0.82rem;letter-spacing:0.04em;font-weight:300}
+
+/* Layout */
+.layout{
+  display:grid;grid-template-columns:1fr 300px;gap:48px;
+  width:100%;align-items:start;
+}
+@media(max-width:760px){.layout{grid-template-columns:1fr;justify-items:center}}
+
+.cube-area{display:flex;flex-direction:column;align-items:center;gap:28px}
 
 /* 3D Cube */
-.scene {
-    width: 220px;
-    height: 220px;
-    perspective: 600px;
-    margin: 20px auto;
+.scene{
+  width:280px;height:280px;perspective:700px;cursor:grab;
+  filter:drop-shadow(0 20px 60px rgba(232,168,48,0.08));
 }
-.cube-3d {
-    width: 220px;
-    height: 220px;
-    position: relative;
-    transform-style: preserve-3d;
-    transform: rotateX(-25deg) rotateY(35deg);
-    transition: transform 0.1s ease;
+.scene:active{cursor:grabbing}
+.cube-3d{
+  width:280px;height:280px;position:relative;
+  transform-style:preserve-3d;
+  transform:rotateX(-25deg) rotateY(35deg);
+  transition:transform 0.08s linear;
 }
-.face-3d {
-    position: absolute;
-    width: 220px;
-    height: 220px;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    grid-template-rows: 1fr 1fr;
-    gap: 6px;
-    padding: 8px;
-    background: #1a1a2e;
-    border: 2px solid #2a2a4a;
-    border-radius: 10px;
-    backface-visibility: hidden;
+.face-3d{
+  position:absolute;width:280px;height:280px;
+  display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
+  gap:8px;padding:10px;
+  background:rgba(14,14,20,0.92);
+  border:1.5px solid var(--border);border-radius:14px;
+  backface-visibility:hidden;
 }
-.face-3d.front  { transform: translateZ(110px); }
-.face-3d.back   { transform: rotateY(180deg) translateZ(110px); }
-.face-3d.right  { transform: rotateY(90deg) translateZ(110px); }
-.face-3d.left   { transform: rotateY(-90deg) translateZ(110px); }
-.face-3d.top    { transform: rotateX(90deg) translateZ(110px); }
-.face-3d.bottom { transform: rotateX(-90deg) translateZ(110px); }
+.face-3d.front{transform:translateZ(140px)}
+.face-3d.back{transform:rotateY(180deg) translateZ(140px)}
+.face-3d.right{transform:rotateY(90deg) translateZ(140px)}
+.face-3d.left{transform:rotateY(-90deg) translateZ(140px)}
+.face-3d.top{transform:rotateX(90deg) translateZ(140px)}
+.face-3d.bottom{transform:rotateX(-90deg) translateZ(140px)}
 
-.sticker-3d {
-    border-radius: 8px;
-    transition: background-color 0.25s ease;
-    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.3);
+.sticker-3d{
+  border-radius:10px;
+  transition:background-color 0.2s ease,box-shadow 0.3s ease;
+  box-shadow:inset 0 1px 2px rgba(255,255,255,0.15),0 2px 8px rgba(0,0,0,0.4);
 }
 
-/* 2D Unfolded View */
-.unfolded {
-    display: grid;
-    grid-template-columns: repeat(4, 56px);
-    grid-template-rows: repeat(3, 56px);
-    gap: 4px;
-    margin: 20px auto;
+/* 2D Flat net */
+.unfolded{
+  display:grid;grid-template-columns:repeat(4,48px);grid-template-rows:repeat(3,48px);
+  gap:3px;opacity:0.7;transition:opacity 0.3s;
 }
-.face-2d {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    grid-template-rows: 1fr 1fr;
-    gap: 3px;
-    padding: 3px;
-    background: #1a1a2e;
-    border-radius: 6px;
+.unfolded:hover{opacity:1}
+.face-2d{
+  display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
+  gap:2px;padding:2px;background:var(--surface);border-radius:5px;
 }
-.face-2d.u { grid-column: 2; grid-row: 1; }
-.face-2d.l { grid-column: 1; grid-row: 2; }
-.face-2d.f { grid-column: 2; grid-row: 2; }
-.face-2d.r { grid-column: 3; grid-row: 2; }
-.face-2d.b { grid-column: 4; grid-row: 2; }
-.face-2d.d { grid-column: 2; grid-row: 3; }
-
-.sticker-2d {
-    width: 24px;
-    height: 24px;
-    border-radius: 4px;
-    transition: background-color 0.25s ease;
-    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.2);
-}
-
-.face-label {
-    position: absolute;
-    font-size: 10px;
-    color: rgba(255,255,255,0.5);
-    font-weight: 700;
-    pointer-events: none;
+.face-2d.u{grid-column:2;grid-row:1}
+.face-2d.l{grid-column:1;grid-row:2}
+.face-2d.f{grid-column:2;grid-row:2}
+.face-2d.r{grid-column:3;grid-row:2}
+.face-2d.b{grid-column:4;grid-row:2}
+.face-2d.d{grid-column:2;grid-row:3}
+.sticker-2d{
+  width:20px;height:20px;border-radius:3px;
+  transition:background-color 0.2s ease;
 }
 
 /* Panel */
-.panel {
-    background: #161625;
-    border: 1px solid #2a2a4a;
-    border-radius: 12px;
-    padding: 24px;
-    min-width: 280px;
+.panel{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:16px;padding:28px;
+  display:flex;flex-direction:column;gap:20px;
 }
-.panel h2 { font-size: 16px; margin-bottom: 16px; color: #aaa; text-transform: uppercase; letter-spacing: 1px; }
-
-.stat-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 8px 0;
-    border-bottom: 1px solid #1e1e35;
-}
-.stat-label { color: #888; font-size: 14px; }
-.stat-value { font-size: 14px; font-weight: 600; font-family: 'SF Mono', 'Cascadia Code', monospace; }
-
-.controls { margin-top: 20px; display: flex; flex-direction: column; gap: 10px; }
-
-.btn {
-    padding: 10px 20px;
-    border: none;
-    border-radius: 8px;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.15s ease;
-}
-.btn:hover { transform: translateY(-1px); }
-.btn:active { transform: translateY(0); }
-.btn-scramble {
-    background: linear-gradient(135deg, #7c4dff, #536dfe);
-    color: white;
-}
-.btn-scramble:hover { box-shadow: 0 4px 15px rgba(124, 77, 255, 0.4); }
-.btn-solve {
-    background: linear-gradient(135deg, #00c853, #00e676);
-    color: #0a0a0a;
-}
-.btn-solve:hover { box-shadow: 0 4px 15px rgba(0, 200, 83, 0.4); }
-.btn-solve:disabled {
-    background: #333;
-    color: #666;
-    cursor: not-allowed;
-    transform: none;
-    box-shadow: none;
-}
-.btn-reset {
-    background: #2a2a4a;
-    color: #aaa;
+.panel-title{
+  font-family:'DM Serif Display',serif;font-size:1.15rem;
+  color:var(--text-bright);margin-bottom:4px;
 }
 
-.speed-control {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-top: 4px;
+.stats{display:flex;flex-direction:column;gap:2px}
+.stat-row{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:9px 0;border-bottom:1px solid var(--border);
 }
-.speed-control label { font-size: 13px; color: #888; }
-.speed-control input[type=range] { flex: 1; accent-color: #7c4dff; }
-.speed-control .speed-val { font-size: 12px; color: #aaa; font-family: monospace; min-width: 40px; }
+.stat-row:last-child{border-bottom:none}
+.stat-label{color:var(--text-dim);font-size:0.82rem;font-weight:300}
+.stat-value{
+  font-family:'JetBrains Mono',monospace;font-size:0.82rem;
+  font-weight:600;color:var(--text-bright);
+}
 
-.scramble-control {
-    display: flex;
-    align-items: center;
-    gap: 10px;
+/* Buttons */
+.controls{display:flex;flex-direction:column;gap:8px}
+.btn{
+  padding:11px 20px;border:none;border-radius:var(--radius);
+  font-family:'Outfit',sans-serif;font-size:0.88rem;font-weight:500;
+  cursor:pointer;transition:all 0.2s ease;letter-spacing:0.02em;
+  position:relative;overflow:hidden;
 }
-.scramble-control label { font-size: 13px; color: #888; }
-.scramble-control input[type=range] { flex: 1; accent-color: #7c4dff; }
-.scramble-control .scramble-val { font-size: 12px; color: #aaa; font-family: monospace; min-width: 20px; }
+.btn::after{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(180deg,rgba(255,255,255,0.06),transparent);
+  pointer-events:none;
+}
+.btn:hover{transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+
+.btn-scramble{
+  background:var(--amber);color:var(--bg);font-weight:600;
+}
+.btn-scramble:hover{box-shadow:0 6px 24px rgba(232,168,48,0.3)}
+
+.btn-solve{background:var(--green);color:var(--bg);font-weight:600}
+.btn-solve:hover{box-shadow:0 6px 24px rgba(61,214,140,0.3)}
+.btn-solve:disabled{
+  background:var(--border);color:var(--text-dim);
+  cursor:not-allowed;transform:none;box-shadow:none;
+}
+
+.btn-reset{background:transparent;color:var(--text-dim);border:1px solid var(--border)}
+.btn-reset:hover{border-color:var(--text-dim);color:var(--text)}
+
+/* Sliders */
+.slider-row{
+  display:flex;align-items:center;gap:10px;
+}
+.slider-row label{font-size:0.78rem;color:var(--text-dim);min-width:44px;font-weight:300}
+.slider-row input[type=range]{
+  flex:1;height:4px;-webkit-appearance:none;appearance:none;
+  background:var(--border);border-radius:2px;outline:none;
+}
+.slider-row input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;width:14px;height:14px;
+  background:var(--amber);border-radius:50%;cursor:pointer;
+  box-shadow:0 0 8px rgba(232,168,48,0.4);
+}
+.slider-val{
+  font-family:'JetBrains Mono',monospace;font-size:0.72rem;
+  color:var(--text-dim);min-width:36px;text-align:right;
+}
 
 /* Move history */
-.move-history {
-    margin-top: 20px;
-    padding-top: 16px;
-    border-top: 1px solid #1e1e35;
+.move-history h3{
+  font-size:0.72rem;color:var(--text-dim);
+  text-transform:uppercase;letter-spacing:0.1em;font-weight:400;
+  margin-bottom:8px;
 }
-.move-history h3 { font-size: 13px; color: #666; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-.moves-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    max-height: 120px;
-    overflow-y: auto;
-    font-family: 'SF Mono', 'Cascadia Code', monospace;
-    font-size: 12px;
+.moves-list{
+  display:flex;flex-wrap:wrap;gap:4px;
+  max-height:100px;overflow-y:auto;
+  font-family:'JetBrains Mono',monospace;font-size:0.72rem;
 }
-.move-tag {
-    padding: 3px 8px;
-    background: #1e1e35;
-    border-radius: 4px;
-    color: #7c4dff;
-    white-space: nowrap;
+.moves-list::-webkit-scrollbar{width:3px}
+.moves-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.move-tag{
+  padding:3px 7px;background:var(--border);border-radius:4px;
+  color:var(--amber);white-space:nowrap;
+  transition:all 0.15s ease;
 }
-.move-tag.latest {
-    background: #2a1e55;
-    color: #b388ff;
-    font-weight: 700;
+.move-tag.latest{
+  background:var(--amber-dim);color:var(--amber);
+  font-weight:600;box-shadow:0 0 10px rgba(232,168,48,0.15);
 }
 
 /* Status badge */
-.status-badge {
-    display: inline-block;
-    padding: 4px 12px;
-    border-radius: 20px;
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1px;
+.status-badge{
+  display:inline-block;padding:4px 12px;border-radius:20px;
+  font-family:'JetBrains Mono',monospace;
+  font-size:0.68rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:0.08em;
 }
-.status-badge.solved { background: #1b5e20; color: #69f0ae; }
-.status-badge.scrambled { background: #4a1c00; color: #ffab40; }
-.status-badge.solving { background: #1a237e; color: #82b1ff; animation: pulse 1s infinite; }
-.status-badge.ready { background: #1e1e35; color: #888; }
+.status-badge.solved{background:var(--green-dim);color:var(--green)}
+.status-badge.scrambled{background:rgba(232,168,48,0.12);color:var(--amber)}
+.status-badge.solving{background:rgba(80,136,232,0.12);color:var(--blue);animation:pulse 1.2s ease infinite}
+.status-badge.ready{background:var(--border);color:var(--text-dim)}
 
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.6; }
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+
+/* Solved celebration */
+@keyframes celebrate{
+  0%{filter:drop-shadow(0 20px 60px rgba(232,168,48,0.08))}
+  50%{filter:drop-shadow(0 20px 80px rgba(61,214,140,0.25))}
+  100%{filter:drop-shadow(0 20px 60px rgba(232,168,48,0.08))}
 }
+.scene.solved-glow{animation:celebrate 1.5s ease 3}
 
-/* Drag rotation */
-.scene { cursor: grab; }
-.scene:active { cursor: grabbing; }
+.face-label{position:absolute;font-size:10px;color:rgba(255,255,255,0.5);font-weight:700;pointer-events:none}
+
+/* Size toggle */
+.size-toggle{display:flex;gap:4px;margin-bottom:4px}
+.size-btn{
+  flex:1;padding:9px;border:1px solid var(--border);border-radius:var(--radius);
+  background:transparent;color:var(--text-dim);font-family:'Outfit',sans-serif;
+  font-size:0.85rem;font-weight:500;cursor:pointer;transition:all 0.2s;
+}
+.size-btn.active{background:var(--amber-dim);color:var(--amber);border-color:var(--amber)}
+.size-btn:hover:not(.active){border-color:var(--text-dim)}
+
+/* Timer */
+.solve-timer{
+  font-family:'JetBrains Mono',monospace;font-size:0.72rem;
+  color:var(--amber);margin-top:4px;min-height:1em;
+}
 </style>
 </head>
 <body>
-<h1>2x2 Rubik's Cube Neural Solver</h1>
-<p class="subtitle">25.4M parameter transformer trained on 615K examples via imitation learning + DAgger</p>
+<div class="container">
 
-<div class="main">
-    <div>
-        <div class="scene" id="scene">
-            <div class="cube-3d" id="cube3d">
-                <div class="face-3d front" id="face-F"></div>
-                <div class="face-3d back" id="face-B"></div>
-                <div class="face-3d right" id="face-R"></div>
-                <div class="face-3d left" id="face-L"></div>
-                <div class="face-3d top" id="face-U"></div>
-                <div class="face-3d bottom" id="face-D"></div>
-            </div>
-        </div>
-        <div class="unfolded" id="unfolded">
-            <div class="face-2d u" id="flat-U"></div>
-            <div class="face-2d l" id="flat-L"></div>
-            <div class="face-2d f" id="flat-F"></div>
-            <div class="face-2d r" id="flat-R"></div>
-            <div class="face-2d b" id="flat-B"></div>
-            <div class="face-2d d" id="flat-D"></div>
-        </div>
+<header>
+  <h1>Neural <span>Cube</span> Solver</h1>
+  <p>85.4M parameter transformer &middot; 2x2 &amp; 3x3 &middot; trained via imitation learning + DAgger</p>
+</header>
+
+<div class="layout">
+  <div class="cube-area">
+    <div class="scene" id="scene">
+      <div class="cube-3d" id="cube3d">
+        <div class="face-3d front" id="face-F"></div>
+        <div class="face-3d back" id="face-B"></div>
+        <div class="face-3d right" id="face-R"></div>
+        <div class="face-3d left" id="face-L"></div>
+        <div class="face-3d top" id="face-U"></div>
+        <div class="face-3d bottom" id="face-D"></div>
+      </div>
+    </div>
+    <div class="unfolded" id="unfolded">
+      <div class="face-2d u" id="flat-U"></div>
+      <div class="face-2d l" id="flat-L"></div>
+      <div class="face-2d f" id="flat-F"></div>
+      <div class="face-2d r" id="flat-R"></div>
+      <div class="face-2d b" id="flat-B"></div>
+      <div class="face-2d d" id="flat-D"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Controls</div>
+
+    <div class="stats">
+      <div class="stat-row">
+        <span class="stat-label">Status</span>
+        <span id="status" class="status-badge ready">Ready</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Steps taken</span>
+        <span class="stat-value" id="step-count">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Residual error</span>
+        <span class="stat-value" id="residual">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Scramble depth</span>
+        <span class="stat-value" id="scramble-len">&mdash;</span>
+      </div>
     </div>
 
-    <div class="panel">
-        <h2>Controls</h2>
-
-        <div class="stat-row">
-            <span class="stat-label">Status</span>
-            <span id="status" class="status-badge ready">Ready</span>
-        </div>
-        <div class="stat-row">
-            <span class="stat-label">Steps</span>
-            <span class="stat-value" id="step-count">0</span>
-        </div>
-        <div class="stat-row">
-            <span class="stat-label">Residual</span>
-            <span class="stat-value" id="residual">0</span>
-        </div>
-        <div class="stat-row">
-            <span class="stat-label">Scramble Length</span>
-            <span class="stat-value" id="scramble-len">-</span>
-        </div>
-
-        <div class="controls">
-            <div class="scramble-control">
-                <label>Moves:</label>
-                <input type="range" id="scramble-depth" min="4" max="30" value="14">
-                <span class="scramble-val" id="scramble-depth-val">14</span>
-            </div>
-            <button class="btn btn-scramble" id="btn-scramble" onclick="doScramble()">Scramble</button>
-            <button class="btn btn-solve" id="btn-solve" onclick="doSolve()" disabled>Solve</button>
-            <button class="btn btn-reset" onclick="doReset()">Reset</button>
-
-            <div class="speed-control">
-                <label>Speed:</label>
-                <input type="range" id="speed" min="50" max="1000" value="300" step="50">
-                <span class="speed-val" id="speed-val">300ms</span>
-            </div>
-        </div>
-
-        <div class="move-history">
-            <h3>Solve Moves</h3>
-            <div class="moves-list" id="moves-list"></div>
-        </div>
+    <div class="controls">
+      <div class="size-toggle">
+        <button class="size-btn active" id="size-2" onclick="setSize(2)">2x2</button>
+        <button class="size-btn" id="size-3" onclick="setSize(3)">3x3</button>
+      </div>
+      <div class="slider-row">
+        <label>Moves</label>
+        <input type="range" id="scramble-depth" min="4" max="30" value="14">
+        <span class="slider-val" id="scramble-depth-val">14</span>
+      </div>
+      <button class="btn btn-scramble" id="btn-scramble" onclick="doScramble()">Scramble</button>
+      <button class="btn btn-solve" id="btn-solve" onclick="doSolveRealtime()" disabled>Solve (real-time)</button>
+      <button class="btn btn-reset" onclick="doReset()">Reset</button>
+      <div class="slider-row">
+        <label>Replay</label>
+        <input type="range" id="speed" min="0" max="500" value="80" step="10">
+        <span class="slider-val" id="speed-val">80ms</span>
+      </div>
     </div>
+
+    <div class="solve-timer" id="solve-timer"></div>
+
+    <div class="move-history">
+      <h3>Solution trace</h3>
+      <div class="moves-list" id="moves-list"></div>
+    </div>
+  </div>
+</div>
+
 </div>
 
 <script>
-const COLORS = {
-    'W': '#ffffff', 'Y': '#ffd500', 'G': '#009b48',
-    'B': '#0046ad', 'R': '#b71234', 'O': '#ff5800'
+const COLORS={
+  W:'#f0eff4',Y:'#f5cc00',G:'#1da34d',
+  B:'#2463c4',R:'#cc2936',O:'#e87020'
 };
+const faces3d=['U','R','F','D','L','B'];
+const faceMap3d={F:'face-F',B:'face-B',R:'face-R',L:'face-L',U:'face-U',D:'face-D'};
+const faceMap2d={U:'flat-U',R:'flat-R',F:'flat-F',D:'flat-D',L:'flat-L',B:'flat-B'};
 
-// Initialize stickers
-const faces3d = ['U', 'R', 'F', 'D', 'L', 'B'];
-const faceMap3d = { 'F': 'face-F', 'B': 'face-B', 'R': 'face-R', 'L': 'face-L', 'U': 'face-U', 'D': 'face-D' };
-const faceMap2d = { 'U': 'flat-U', 'R': 'flat-R', 'F': 'flat-F', 'D': 'flat-D', 'L': 'flat-L', 'B': 'flat-B' };
+let cubeSize=2, solving=false, solveAbort=false;
 
-function initStickers() {
-    for (const face of faces3d) {
-        const el3d = document.getElementById(faceMap3d[face]);
-        const el2d = document.getElementById(faceMap2d[face]);
-        el3d.innerHTML = '';
-        el2d.innerHTML = '';
-        for (let i = 0; i < 4; i++) {
-            const s3d = document.createElement('div');
-            s3d.className = 'sticker-3d';
-            s3d.id = `s3d-${face}-${i}`;
-            el3d.appendChild(s3d);
-
-            const s2d = document.createElement('div');
-            s2d.className = 'sticker-2d';
-            s2d.id = `s2d-${face}-${i}`;
-            el2d.appendChild(s2d);
-        }
+function initStickers(n){
+  cubeSize=n;
+  // 3D faces
+  for(const face of faces3d){
+    const el=document.getElementById(faceMap3d[face]);
+    el.innerHTML='';
+    el.style.gridTemplateColumns=`repeat(${n},1fr)`;
+    el.style.gridTemplateRows=`repeat(${n},1fr)`;
+    for(let i=0;i<n*n;i++){
+      const s=document.createElement('div');
+      s.className='sticker-3d';s.id=`s3d-${face}-${i}`;el.appendChild(s);
     }
-}
-
-function updateCube(faceGrids) {
-    for (const face of faces3d) {
-        const grid = faceGrids[face];
-        for (let r = 0; r < 2; r++) {
-            for (let c = 0; c < 2; c++) {
-                const idx = r * 2 + c;
-                const color = COLORS[grid[r][c]];
-                document.getElementById(`s3d-${face}-${idx}`).style.backgroundColor = color;
-                document.getElementById(`s2d-${face}-${idx}`).style.backgroundColor = color;
-            }
-        }
+  }
+  // 2D flat
+  const unfoldedEl=document.getElementById('unfolded');
+  const stickerSize=n===2?48:32;
+  unfoldedEl.style.gridTemplateColumns=`repeat(4,${stickerSize}px)`;
+  unfoldedEl.style.gridTemplateRows=`repeat(3,${stickerSize}px)`;
+  for(const face of faces3d){
+    const el=document.getElementById(faceMap2d[face]);
+    el.innerHTML='';
+    el.style.gridTemplateColumns=`repeat(${n},1fr)`;
+    el.style.gridTemplateRows=`repeat(${n},1fr)`;
+    for(let i=0;i<n*n;i++){
+      const s=document.createElement('div');
+      s.className='sticker-2d';s.id=`s2d-${face}-${i}`;
+      s.style.width=`${Math.floor((stickerSize-n*2-4)/n)}px`;
+      s.style.height=s.style.width;
+      el.appendChild(s);
     }
+  }
+  // Adjust 3D cube size
+  const cubeW=n===2?280:280;
+  const half=cubeW/2;
+  document.querySelectorAll('.face-3d').forEach(f=>{f.style.width=f.style.height=cubeW+'px'});
+  document.querySelector('.face-3d.front').style.transform=`translateZ(${half}px)`;
+  document.querySelector('.face-3d.back').style.transform=`rotateY(180deg) translateZ(${half}px)`;
+  document.querySelector('.face-3d.right').style.transform=`rotateY(90deg) translateZ(${half}px)`;
+  document.querySelector('.face-3d.left').style.transform=`rotateY(-90deg) translateZ(${half}px)`;
+  document.querySelector('.face-3d.top').style.transform=`rotateX(90deg) translateZ(${half}px)`;
+  document.querySelector('.face-3d.bottom').style.transform=`rotateX(-90deg) translateZ(${half}px)`;
 }
 
-function updateStats(data) {
-    document.getElementById('step-count').textContent = data.step_count;
-    document.getElementById('residual').textContent = data.residual;
-    document.getElementById('scramble-len').textContent = data.scramble_length || '-';
-
-    const badge = document.getElementById('status');
-    if (data.solved) {
-        badge.className = 'status-badge solved';
-        badge.textContent = 'Solved!';
-    } else if (solving) {
-        badge.className = 'status-badge solving';
-        badge.textContent = 'Solving...';
-    } else if (data.step_count === 0 && data.scramble_length > 0) {
-        badge.className = 'status-badge scrambled';
-        badge.textContent = 'Scrambled';
-    } else {
-        badge.className = 'status-badge ready';
-        badge.textContent = 'Ready';
+function updateCube(fg){
+  for(const face of faces3d){
+    const grid=fg[face]; const n=grid.length;
+    for(let r=0;r<n;r++)for(let c=0;c<n;c++){
+      const idx=r*n+c,color=COLORS[grid[r][c]];
+      const s3=document.getElementById(`s3d-${face}-${idx}`);
+      const s2=document.getElementById(`s2d-${face}-${idx}`);
+      if(s3)s3.style.backgroundColor=color;
+      if(s2)s2.style.backgroundColor=color;
     }
+  }
 }
 
-let solving = false;
-let solveAbort = false;
-
-async function api(endpoint, body = {}) {
-    const resp = await fetch(`/api/${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    });
-    return resp.json();
+function updateStats(data){
+  document.getElementById('step-count').textContent=data.step_count;
+  document.getElementById('residual').textContent=data.residual;
+  document.getElementById('scramble-len').textContent=data.scramble_length||'\u2014';
+  const badge=document.getElementById('status');
+  const sc=document.getElementById('scene');
+  if(data.solved){
+    badge.className='status-badge solved';badge.textContent='Solved';sc.classList.add('solved-glow');
+  }else if(solving){
+    badge.className='status-badge solving';badge.textContent='Solving\u2026';sc.classList.remove('solved-glow');
+  }else if(data.step_count===0&&data.scramble_length>0){
+    badge.className='status-badge scrambled';badge.textContent='Scrambled';sc.classList.remove('solved-glow');
+  }else{
+    badge.className='status-badge ready';badge.textContent='Ready';sc.classList.remove('solved-glow');
+  }
 }
 
-async function doScramble() {
-    solveAbort = true;
-    solving = false;
-    const length = parseInt(document.getElementById('scramble-depth').value);
-    const data = await api('scramble', { length });
-    updateCube(data.face_grids);
-    updateStats(data);
-    document.getElementById('moves-list').innerHTML = '';
-    document.getElementById('btn-solve').disabled = false;
+async function api(endpoint,body={}){
+  const r=await fetch(`/api/${endpoint}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  return r.json();
 }
 
-async function doSolve() {
-    if (solving) return;
-    solving = true;
-    solveAbort = false;
-    document.getElementById('btn-solve').disabled = true;
+async function setSize(n){
+  solveAbort=true;solving=false;
+  document.querySelectorAll('.size-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById(`size-${n}`).classList.add('active');
+  initStickers(n);
+  const data=await api('reset',{size:n});
+  updateCube(data.face_grids);updateStats(data);
+  document.getElementById('moves-list').innerHTML='';
+  document.getElementById('solve-timer').textContent='';
+  document.getElementById('btn-solve').disabled=true;
+}
 
-    const badge = document.getElementById('status');
-    badge.className = 'status-badge solving';
-    badge.textContent = 'Solving...';
+async function doScramble(){
+  solveAbort=true;solving=false;
+  const length=parseInt(document.getElementById('scramble-depth').value);
+  const data=await api('scramble',{length,size:cubeSize});
+  initStickers(cubeSize);
+  updateCube(data.face_grids);updateStats(data);
+  document.getElementById('moves-list').innerHTML='';
+  document.getElementById('solve-timer').textContent='';
+  document.getElementById('btn-solve').disabled=false;
+}
 
-    const movesList = document.getElementById('moves-list');
-    const speed = parseInt(document.getElementById('speed').value);
+async function doSolveRealtime(){
+  if(solving)return;solving=true;solveAbort=false;
+  document.getElementById('btn-solve').disabled=true;
+  const badge=document.getElementById('status');
+  badge.className='status-badge solving';badge.textContent='Thinking\u2026';
+  const timer=document.getElementById('solve-timer');
+  const movesList=document.getElementById('moves-list');
+  const t0=performance.now();
+  timer.textContent='Computing solution\u2026';
 
-    for (let i = 0; i < ROLLOUT_MAX; i++) {
-        if (solveAbort) break;
-        const data = await api('step');
+  // Server computes entire solution at once (real-time, no artificial delay)
+  const result=await api('solve_all');
+  const elapsed=((performance.now()-t0)/1000).toFixed(2);
+  const snapshots=result.snapshots;
 
-        updateCube(data.face_grids);
-        updateStats(data);
+  if(!snapshots.length){
+    timer.textContent='No solution found';
+    solving=false;return;
+  }
 
-        if (data.move) {
-            // Add move tag
-            // Remove latest class from previous
-            const prev = movesList.querySelector('.latest');
-            if (prev) prev.classList.remove('latest');
-            const tag = document.createElement('span');
-            tag.className = 'move-tag latest';
-            tag.textContent = data.move;
-            movesList.appendChild(tag);
-            movesList.scrollTop = movesList.scrollHeight;
-        }
+  const solved=snapshots[snapshots.length-1].solved;
+  timer.textContent=`${snapshots.length} moves in ${elapsed}s (model inference)`;
 
-        if (data.solved) {
-            badge.className = 'status-badge solved';
-            badge.textContent = 'Solved!';
-            solving = false;
-            return;
-        }
+  // Replay the solution visually
+  const replayDelay=parseInt(document.getElementById('speed').value);
+  for(let i=0;i<snapshots.length;i++){
+    if(solveAbort)break;
+    const snap=snapshots[i];
+    updateCube(snap.face_grids);
+    updateStats(snap);
+    // Move tag
+    const prev=movesList.querySelector('.latest');
+    if(prev)prev.classList.remove('latest');
+    const tag=document.createElement('span');
+    tag.className='move-tag latest';tag.textContent=snap.move;
+    movesList.appendChild(tag);movesList.scrollTop=movesList.scrollHeight;
 
-        if (!data.move) {
-            solving = false;
-            return;
-        }
-
-        await new Promise(r => setTimeout(r, speed));
+    if(replayDelay>0&&i<snapshots.length-1){
+      await new Promise(r=>setTimeout(r,replayDelay));
     }
-    solving = false;
+  }
+  if(solved){
+    badge.className='status-badge solved';badge.textContent='Solved';
+    document.getElementById('scene').classList.add('solved-glow');
+  }
+  solving=false;
 }
 
-async function doReset() {
-    solveAbort = true;
-    solving = false;
-    const data = await api('reset');
-    updateCube(data.face_grids);
-    updateStats(data);
-    document.getElementById('moves-list').innerHTML = '';
-    document.getElementById('btn-solve').disabled = true;
+async function doReset(){
+  solveAbort=true;solving=false;
+  const data=await api('reset',{size:cubeSize});
+  updateCube(data.face_grids);updateStats(data);
+  document.getElementById('moves-list').innerHTML='';
+  document.getElementById('solve-timer').textContent='';
+  document.getElementById('btn-solve').disabled=true;
 }
 
-const ROLLOUT_MAX = 200;
-
-// Speed slider
-document.getElementById('speed').addEventListener('input', (e) => {
-    document.getElementById('speed-val').textContent = e.target.value + 'ms';
+document.getElementById('speed').addEventListener('input',e=>{
+  document.getElementById('speed-val').textContent=e.target.value+'ms';
 });
-document.getElementById('scramble-depth').addEventListener('input', (e) => {
-    document.getElementById('scramble-depth-val').textContent = e.target.value;
+document.getElementById('scramble-depth').addEventListener('input',e=>{
+  document.getElementById('scramble-depth-val').textContent=e.target.value;
 });
 
 // Drag to rotate 3D cube
-let isDragging = false;
-let prevX = 0, prevY = 0;
-let rotX = -25, rotY = 35;
-const scene = document.getElementById('scene');
-const cube3d = document.getElementById('cube3d');
-
-scene.addEventListener('mousedown', (e) => {
-    isDragging = true;
-    prevX = e.clientX;
-    prevY = e.clientY;
+let isDragging=false,prevX=0,prevY=0,rotX=-25,rotY=35;
+const scene=document.getElementById('scene'),cube3d=document.getElementById('cube3d');
+scene.addEventListener('mousedown',e=>{isDragging=true;prevX=e.clientX;prevY=e.clientY});
+window.addEventListener('mousemove',e=>{
+  if(!isDragging)return;
+  rotY+=(e.clientX-prevX)*0.5;rotX-=(e.clientY-prevY)*0.5;
+  cube3d.style.transform=`rotateX(${rotX}deg) rotateY(${rotY}deg)`;
+  prevX=e.clientX;prevY=e.clientY;
 });
-window.addEventListener('mousemove', (e) => {
-    if (!isDragging) return;
-    const dx = e.clientX - prevX;
-    const dy = e.clientY - prevY;
-    rotY += dx * 0.5;
-    rotX -= dy * 0.5;
-    cube3d.style.transform = `rotateX(${rotX}deg) rotateY(${rotY}deg)`;
-    prevX = e.clientX;
-    prevY = e.clientY;
-});
-window.addEventListener('mouseup', () => { isDragging = false; });
+window.addEventListener('mouseup',()=>{isDragging=false});
 
 // Init
-initStickers();
-(async () => {
-    const data = await api('reset');
-    updateCube(data.face_grids);
-    updateStats(data);
-})();
+initStickers(2);
+(async()=>{const data=await api('reset');updateCube(data.face_grids);updateStats(data)})();
 </script>
 </body>
 </html>
@@ -948,7 +996,8 @@ class PlaygroundHandler(BaseHTTPRequestHandler):
 
         if self.path == '/api/scramble':
             length = body.get('length', 14)
-            state.scramble(length)
+            size = body.get('size', state.cube_size)
+            state.scramble(length, size=size)
             result = state.to_json()
 
         elif self.path == '/api/step':
@@ -959,8 +1008,16 @@ class PlaygroundHandler(BaseHTTPRequestHandler):
             else:
                 result['move'] = None
 
+        elif self.path == '/api/solve_all':
+            snapshots = state.solve_all()
+            result = {
+                "snapshots": snapshots,
+                "final": state.to_json(),
+            }
+
         elif self.path == '/api/reset':
-            state.reset()
+            size = body.get('size', state.cube_size)
+            state.reset(size=size)
             result = state.to_json()
 
         else:
