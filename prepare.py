@@ -36,23 +36,25 @@ from rubiks import (
     scramble_length_for_size,
 )
 from teacher_dwalton import solve_cube_222, solve_cube_333
+from teacher_cfop import solve_cube_333_cfop
+from teacher_pycuber import solve_cube_333_pycuber
 
 # ---------------------------------------------------------------------------
 # Constants (fixed for v1)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 72
+MAX_SEQ_LEN = 74
 TIME_BUDGET = 10800
 TEACHER_BACKEND = "dwalton76/rubiks-cube-NxNxN-solver"
-PROMPT_FORMAT_VERSION = "flat24-history3-jointmove-v1"
+PROMPT_FORMAT_VERSION = "flat24-history3-jointmove-kociemba-v2"
 
 TRAIN_SIZES = (2, 3)
 ID_VAL_SIZES = TRAIN_SIZES
 OOD_DEV_SIZES = ()
 OOD_TEST_SIZES = ()
 
-TRAIN_EPISODES_PER_SIZE = 65536  # balanced 1:1 ratio
-_TRAIN_EPISODES_OVERRIDE = {}  # no override, use TRAIN_EPISODES_PER_SIZE for all sizes
+TRAIN_EPISODES_PER_SIZE = 65536  # base
+_TRAIN_EPISODES_OVERRIDE = {3: 131072}  # 2x more 3x3 for better state coverage
 ID_VAL_EPISODES_PER_SIZE = 256
 OOD_DEV_EPISODES_PER_SIZE = 0
 OOD_TEST_EPISODES_PER_SIZE = 0
@@ -195,6 +197,12 @@ def build_vocab() -> list[str]:
     for face in ("U", "R", "F", "D", "L", "B"):
         for turn in ("CW", "CCW", "HALF"):
             tokens.append(f"MOVE_{face}_{turn}")
+    # CFOP stage-conditioning tokens
+    tokens.append("STAGE_CROSS")
+    tokens.append("STAGE_F2L")
+    tokens.append("STAGE_OLL")
+    tokens.append("STAGE_PLL")
+    tokens.append("STAGE_SOLVED")
     return tokens
 
 
@@ -297,6 +305,23 @@ def encode_supervised_example(tokenizer: Tokenizer, prompt_tokens: list[str], an
 
 
 def episode_to_examples(tokenizer: Tokenizer, episode: Episode) -> list[dict[str, object]]:
+    # Use sub-goal training for CFOP episodes (3x3 with staged solutions)
+    staged = getattr(episode, '_staged_solution', None)
+    if staged:
+        from rubiks import build_subgoal_training_examples
+        examples = []
+        for prompt_tokens, answer_tokens, distance in build_subgoal_training_examples(
+            episode.size, episode.scramble, staged,
+        ):
+            try:
+                encoded = encode_supervised_example(tokenizer, prompt_tokens, answer_tokens)
+                encoded["size"] = episode.size
+                encoded["distance_to_goal"] = distance
+                examples.append(encoded)
+            except (ValueError, AssertionError):
+                continue  # skip if sequence too long
+        return examples
+
     examples = []
     for prompt_tokens, answer_tokens, distance in build_training_examples_from_solution(
         episode.size,
@@ -336,17 +361,23 @@ def generate_teacher_episode(size: int, rng: random.Random, scramble_length: int
 
     if size == 2:
         solution = solve_cube_222(cube)
+        return Episode(
+            size=size,
+            scramble=scramble,
+            solution=solution,
+            max_rollout_steps=max(8, len(solution) * 2),
+        )
     elif size == 3:
+        # Kociemba teacher: short ~20-move solutions, best for beam search
         solution = solve_cube_333(cube)
+        return Episode(
+            size=size,
+            scramble=scramble,
+            solution=solution,
+            max_rollout_steps=max(8, len(solution) * 2),
+        )
     else:
         raise NotImplementedError(f"Teacher backend is not integrated for size {size} yet")
-
-    return Episode(
-        size=size,
-        scramble=scramble,
-        solution=solution,
-        max_rollout_steps=max(8, len(solution) * 2),
-    )
 
 
 def _generate_perturbed_examples(

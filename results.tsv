@@ -62,3 +62,4 @@ d12v7	0.501953	0.735700	0.501953	-	129599	keep	D=12 3hr 65K/size val_w=0.5 — g
 d12v5+beam	-	-	-	-	-	keep	d12v5 model + beam search (width=8) — 3x3:56% on 32-cube subset
 d12v7+beam	-	-	-	-	-	keep	BEST 3x3: beam w=8: 3x3:55.5% (142/256 full) | w=16: 67.2% (64 subset) | greedy 2x2:96%
 d12v5+beam32	-	-	-	-	-	keep	BEST OVERALL: d12v5 + beam search (w=32) — 2x2:90% 3x3:70% combined:80% on full 256/size eval\!
+d12v8	0.500000	-	0.500000	-	58000	keep	D=12 3hr 65K 2x2 + 131K 3x3 Kociemba — greedy: 2x2:89% 3x3:11% | beam w=8: 2x2:94% 3x3:84%!

@@ -294,8 +294,70 @@ def digit_tokens_to_int(tokens: Iterable[str]) -> int:
     return int("".join(digits))
 
 
+def detect_cfop_stage(cube: Cube) -> str:
+    """Detect which CFOP stage a 3x3 cube is in, checking from solved backwards.
+
+    Returns one of: "CROSS", "F2L", "OLL", "PLL", "SOLVED".
+    For 2x2, always returns "CROSS" (no meaningful CFOP stages).
+    """
+    if cube.size < 3:
+        return "CROSS"
+
+    if cube.is_solved():
+        return "SOLVED"
+
+    d_grid = cube.face_grid("D")
+    d_center = d_grid[1][1]
+
+    # Check if F2L is complete: D face fully uniform + bottom two rows of
+    # F, R, B, L each match their own center color.
+    def _f2l_done() -> bool:
+        # D face must be fully uniform (all 9 stickers match center)
+        for row in d_grid:
+            for color in row:
+                if color != d_center:
+                    return False
+        # Bottom two rows of each lateral face must match that face's center
+        for face in ("F", "R", "B", "L"):
+            grid = cube.face_grid(face)
+            center = grid[1][1]
+            # Rows are indexed 0=top, 1=middle, 2=bottom for a 3x3.
+            # "Bottom two rows" = rows 1 and 2 (the two rows adjacent to D).
+            for r in range(1, 3):
+                for c in range(3):
+                    if grid[r][c] != center:
+                        return False
+        return True
+
+    f2l_done = _f2l_done()
+
+    if f2l_done:
+        # Check OLL: all 9 stickers on U face are the same color
+        u_grid = cube.face_grid("U")
+        u_center = u_grid[1][1]
+        oll_done = all(u_grid[r][c] == u_center for r in range(3) for c in range(3))
+        if oll_done:
+            # F2L done + OLL done + not solved => PLL
+            return "PLL"
+        else:
+            # F2L done but U face not uniform => OLL
+            return "OLL"
+
+    # Check if D-face cross edges are in place (4 edge stickers on D match D center)
+    d_edges = [d_grid[0][1], d_grid[1][0], d_grid[1][2], d_grid[2][1]]
+    cross_done = all(e == d_center for e in d_edges)
+    if cross_done:
+        return "F2L"
+
+    return "CROSS"
+
+
 def build_prompt_tokens(size: int, cube: Cube, history: list[Move] | None = None) -> list[str]:
     tokens = ["<TASK_POLICY>", "<SIZE>", *int_to_digit_tokens(size), "</SIZE>"]
+    # Add CFOP stage for 3x3
+    if size >= 3:
+        stage = detect_cfop_stage(cube)
+        tokens.append(f"STAGE_{stage}")
     # Flat sticker colors in fixed face/row/col order (URFDLB)
     for face in FACE_ORDER:
         for row in cube.face_grid(face):
@@ -327,6 +389,67 @@ def parse_answer_tokens(tokens: list[str]) -> Move | None:
         turns = {"CW": 1, "CCW": -1, "HALF": 2}[turn_name]
         return Move(face=face, depth=1, width=1, turns=turns)
     raise ValueError(f"Expected MOVE_* or <DONE>, got {tokens[0]}")
+
+
+def build_subgoal_training_examples(
+    size: int,
+    scramble: tuple[Move, ...],
+    staged_solution: list[tuple[str, "Move"]],
+) -> list[tuple[list[str], list[str], int]]:
+    """Build training examples with sub-goal structure.
+
+    Each CFOP stage is a separate sub-task. distance_to_goal is the
+    number of moves until the current sub-goal (stage) is complete,
+    NOT until the whole cube is solved. A <DONE> is emitted at the
+    end of each stage transition.
+
+    Uses the teacher's stage labels directly (not detect_cfop_stage)
+    because Y rotations during CFOP solving reorient the cube.
+    """
+    cube = Cube(size)
+    cube.apply_moves(scramble)
+    examples: list[tuple[list[str], list[str], int]] = []
+    history: list[Move] = []
+
+    # Group consecutive moves by stage
+    segments: list[tuple[str, list[Move]]] = []
+    for stage, move in staged_solution:
+        if not segments or segments[-1][0] != stage:
+            segments.append((stage, []))
+        segments[-1][1].append(move)
+
+    for seg_idx, (stage, moves) in enumerate(segments):
+        n_moves = len(moves)
+        for i, move in enumerate(moves):
+            # Build prompt with teacher's stage label (override detect_cfop_stage)
+            prompt_tokens = _build_prompt_with_stage(size, cube, stage, history=history)
+            answer_tokens = build_answer_tokens(move)
+            examples.append((prompt_tokens, answer_tokens, n_moves - i))
+            cube.apply_move(move)
+            history.append(move)
+
+        # Emit DONE at end of each stage (sub-goal complete)
+        next_stage = segments[seg_idx + 1][0] if seg_idx + 1 < len(segments) else "SOLVED"
+        prompt_tokens = _build_prompt_with_stage(size, cube, next_stage, history=history)
+        examples.append((prompt_tokens, build_answer_tokens(None), 0))
+
+    return examples
+
+
+def _build_prompt_with_stage(
+    size: int, cube: Cube, stage: str, history: list[Move] | None = None
+) -> list[str]:
+    """Build prompt tokens with an explicit stage label (not auto-detected)."""
+    tokens = ["<TASK_POLICY>", "<SIZE>", *int_to_digit_tokens(size), "</SIZE>"]
+    tokens.append(f"STAGE_{stage}")
+    for face in FACE_ORDER:
+        for row in cube.face_grid(face):
+            tokens.extend(f"COL_{color}" for color in row)
+    if history:
+        for move in history[-3:]:
+            tokens.append(f"MOVE_{move.face}_{move.turn_name()}")
+    tokens.append("<TARGET>")
+    return tokens
 
 
 def build_training_examples(size: int, scramble: tuple[Move, ...]) -> list[tuple[list[str], list[str]]]:

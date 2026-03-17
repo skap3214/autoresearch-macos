@@ -304,7 +304,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
-        # Value head: init to predict ~5 (midrange distance)
+        # Value head: init to predict ~5 (midrange distance for Kociemba)
         torch.nn.init.normal_(self.value_head.weight, mean=0.0, std=0.01)
         torch.nn.init.constant_(self.value_head.bias, 5.0)
         # Rotary embeddings
@@ -624,11 +624,11 @@ ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention (4 heads for more diverse patterns)
 WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 
-# Sequence length for training (3x3: 54 stickers + 5 markers + 3 history + 1 answer ≈ 63 tokens)
-TRAIN_SEQ_LEN = 64
+# Sequence length for training (3x3: 54 stickers + 5 markers + 1 stage + 3 history + 1 answer ≈ 65 tokens)
+TRAIN_SEQ_LEN = 66
 
 # Optimization
-TOTAL_BATCH_SIZE = 16384  # = 256 * 64, one microstep per optimizer step
+TOTAL_BATCH_SIZE = 16896  # = 256 * 66, one microstep per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.12        # learning rate for matrix parameters (Muon)
@@ -768,10 +768,17 @@ value_mlp = ValueMLP().to(device)
 value_mlp_optimizer = torch.optim.Adam(value_mlp.parameters(), lr=1e-3)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, TRAIN_SEQ_LEN, "train")
+val_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, TRAIN_SEQ_LEN, "val")
 x, y, d, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+# Validation & checkpointing config
+VAL_EVERY = 2000          # compute val loss every N steps
+QUICK_EVAL_EVERY = 5000   # run quick solve eval every N steps
+QUICK_EVAL_CUBES = 32     # cubes per size for quick eval
+PATIENCE = 5              # early stop after N val checks without improvement
 
 metrics_file = open(metrics_csv_path, "w", newline="", encoding="utf-8")
 metrics_writer = csv.DictWriter(
@@ -780,6 +787,7 @@ metrics_writer = csv.DictWriter(
         "step",
         "progress",
         "loss",
+        "val_loss",
         "lr_multiplier",
         "dt_ms",
         "tok_per_sec",
@@ -791,6 +799,10 @@ metrics_writer = csv.DictWriter(
 metrics_writer.writeheader()
 metrics_file.flush()
 loss_history: list[tuple[int, float]] = []
+val_loss_history: list[tuple[int, float]] = []
+best_val_loss = float("inf")
+patience_counter = 0
+last_val_loss = None
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -921,6 +933,36 @@ def _make_dataloader_from_examples(tokenizer, examples, B, T, shuffle=True):
 # Training loop
 # ---------------------------------------------------------------------------
 
+def compute_val_loss(model, val_loader, num_batches=20):
+    """Compute average validation loss over a few batches."""
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for _ in range(num_batches):
+            vx, vy, vd, _ = next(val_loader)
+            with autocast_ctx:
+                vloss = model(vx, vy, distances=vd)
+            total_loss += vloss.item()
+    model.train()
+    return total_loss / num_batches
+
+
+def quick_solve_eval(model, tokenizer, num_cubes=32):
+    """Quick solve eval on a small subset — returns {size: solve_rate}."""
+    from prepare import load_dataset, evaluate_rollouts
+    from rubiks import Episode
+    payload = load_dataset()
+    all_eps = [Episode.from_dict(e) for e in payload["eval_episodes"]["id"]]
+    results = {}
+    for size in TRAIN_SIZES:
+        eps = [e for e in all_eps if e.size == size][:num_cubes]
+        if eps:
+            sr, _ = evaluate_rollouts(model, tokenizer, eps)
+            results[size] = sr
+    return results
+
+TRAIN_SIZES = (2, 3)  # for quick eval
+
 t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
@@ -1009,6 +1051,7 @@ while True:
         "step": step,
         "progress": progress,
         "loss": debiased_smooth_loss,
+        "val_loss": last_val_loss if last_val_loss is not None else "",
         "lr_multiplier": lrm,
         "dt_ms": dt * 1000,
         "tok_per_sec": tok_per_sec,
@@ -1018,6 +1061,44 @@ while True:
     })
     metrics_file.flush()
     loss_history.append((step, debiased_smooth_loss))
+
+    # Periodic validation loss
+    if step > 0 and step % VAL_EVERY == 0:
+        val_loss = compute_val_loss(model, val_loader)
+        val_loss_history.append((step, val_loss))
+        last_val_loss = val_loss
+
+        # Best checkpoint saving
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_ckpt_path = run_dir / "model_best.pt"
+            raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+            torch.save({
+                'model_state_dict': raw.state_dict(),
+                'value_mlp_state_dict': value_mlp.state_dict(),
+                'config': asdict(config),
+                'step': step,
+                'val_loss': val_loss,
+            }, best_ckpt_path)
+            marker = " [BEST, saved]"
+        else:
+            patience_counter += 1
+            marker = f" [no improve x{patience_counter}]"
+
+        print(f"\n  val_loss: {val_loss:.4f} | train_loss: {debiased_smooth_loss:.4f} | gap: {val_loss - debiased_smooth_loss:.4f}{marker}")
+
+        # Early stopping
+        if patience_counter >= PATIENCE and progress > 0.5:
+            print(f"\n  Early stopping: val loss hasn't improved in {PATIENCE} checks. Stopping.")
+            break
+
+    # Quick solve eval
+    if step > 0 and step % QUICK_EVAL_EVERY == 0:
+        print(f"\n  Quick eval ({QUICK_EVAL_CUBES} cubes/size)...", end="", flush=True)
+        solve_results = quick_solve_eval(model, tokenizer, QUICK_EVAL_CUBES)
+        parts = [f"{s}x{s}:{r:.0%}" for s, r in sorted(solve_results.items())]
+        print(f" {' | '.join(parts)}")
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -1128,10 +1209,14 @@ metrics_file.close()
 if loss_history:
     xs, ys = zip(*loss_history)
     plt.figure(figsize=(8, 4.5))
-    plt.plot(xs, ys, color="#225c4a", linewidth=2)
-    plt.title("Training Loss")
+    plt.plot(xs, ys, color="#225c4a", linewidth=2, label="Train loss")
+    if val_loss_history:
+        vxs, vys = zip(*val_loss_history)
+        plt.plot(vxs, vys, color="#c44e52", linewidth=2, marker="o", markersize=4, label="Val loss")
+    plt.title("Training & Validation Loss")
     plt.xlabel("Step")
-    plt.ylabel("Smoothed Loss")
+    plt.ylabel("Loss")
+    plt.legend()
     plt.grid(alpha=0.2)
     plt.tight_layout()
     plt.savefig(loss_plot_path, dpi=180)
