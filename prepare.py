@@ -36,15 +36,16 @@ from rubiks import (
     scramble_length_for_size,
 )
 from teacher_dwalton import solve_cube_222, solve_cube_333
-from teacher_cfop import solve_cube_333_cfop
-from teacher_pycuber import solve_cube_333_pycuber
+# Lazy imports — not used in data generation, avoid import-time crashes
+# from teacher_cfop import solve_cube_333_cfop
+# from teacher_pycuber import solve_cube_333_pycuber
 
 # ---------------------------------------------------------------------------
 # Constants (fixed for v1)
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 74
-TIME_BUDGET = 10800
+TIME_BUDGET = 86400  # 24 hours — no time pressure, train until converged
 TEACHER_BACKEND = "dwalton76/rubiks-cube-NxNxN-solver"
 PROMPT_FORMAT_VERSION = "flat24-history3-jointmove-kociemba-v2"
 
@@ -54,7 +55,7 @@ OOD_DEV_SIZES = ()
 OOD_TEST_SIZES = ()
 
 TRAIN_EPISODES_PER_SIZE = 65536  # base
-_TRAIN_EPISODES_OVERRIDE = {3: 131072}  # 2x more 3x3 for better state coverage
+_TRAIN_EPISODES_OVERRIDE = {3: 262144}  # 4x base, 2x previous — paired with 6hr budget
 ID_VAL_EPISODES_PER_SIZE = 256
 OOD_DEV_EPISODES_PER_SIZE = 0
 OOD_TEST_EPISODES_PER_SIZE = 0

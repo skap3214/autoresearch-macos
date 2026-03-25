@@ -628,7 +628,7 @@ WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 TRAIN_SEQ_LEN = 66
 
 # Optimization
-TOTAL_BATCH_SIZE = 16896  # = 256 * 66, one microstep per optimizer step
+TOTAL_BATCH_SIZE = 67584  # = 1024 * 66, maximize A100 utilization
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.12        # learning rate for matrix parameters (Muon)
@@ -641,7 +641,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 12              # number of transformer layers (sweet spot for 2hr budget)
-DEVICE_BATCH_SIZE = 256  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 1024  # 4x increase for A100 40GB (was using only 8GB)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -666,7 +666,7 @@ else:
     import contextlib
     autocast_ctx = contextlib.nullcontext()
 
-H100_BF16_PEAK_FLOPS = 989.5e12
+H100_BF16_PEAK_FLOPS = 312e12  # A100-SXM4-40GB bf16 peak
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -778,7 +778,7 @@ print(f"Gradient accumulation steps: {grad_accum_steps}")
 VAL_EVERY = 2000          # compute val loss every N steps
 QUICK_EVAL_EVERY = 5000   # run quick solve eval every N steps
 QUICK_EVAL_CUBES = 32     # cubes per size for quick eval
-PATIENCE = 5              # early stop after N val checks without improvement
+PATIENCE = 999            # effectively disabled — let training run full budget
 
 metrics_file = open(metrics_csv_path, "w", newline="", encoding="utf-8")
 metrics_writer = csv.DictWriter(
