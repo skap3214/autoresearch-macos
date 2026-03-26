@@ -518,6 +518,139 @@ def scramble_length_for_size(size: int) -> int:
     return 6 + size * 4
 
 
+# ---------------------------------------------------------------------------
+# Symmetry augmentation: 24 rotational symmetries of the cube
+# ---------------------------------------------------------------------------
+
+def _apply_whole_cube_rotation(cube: "Cube", axis: str, quarter_turns: int) -> "Cube":
+    """Rotate the entire cube (all stickers) around an axis. Returns a new Cube."""
+    rotated = Cube(cube.size)
+    rotated.stickers = {}
+    qt = quarter_turns % 4
+    for (position, normal), color in cube.stickers.items():
+        new_pos = rotate_vec(position, axis, qt)
+        new_norm = rotate_vec(normal, axis, qt)
+        rotated.stickers[(new_pos, new_norm)] = color
+    return rotated
+
+
+def _enumerate_24_rotations() -> list[list[tuple[str, int]]]:
+    """Enumerate all 24 rotational symmetries as sequences of (axis, quarter_turns).
+    Deduplicates by checking the resulting face permutation."""
+    seen: set[tuple[str, ...]] = set()
+    rotations: list[list[tuple[str, int]]] = []
+
+    for x in range(4):
+        for y in range(4):
+            for z in range(4):
+                # Compute face permutation under this rotation
+                perm = []
+                for face in FACE_ORDER:
+                    normal = FACE_NORMALS[face]
+                    n = normal
+                    if x:
+                        n = rotate_vec(n, "x", x)
+                    if y:
+                        n = rotate_vec(n, "y", y)
+                    if z:
+                        n = rotate_vec(n, "z", z)
+                    # Find which face has this normal
+                    for f, fn in FACE_NORMALS.items():
+                        if fn == n:
+                            perm.append(f)
+                            break
+                perm_key = tuple(perm)
+                if perm_key not in seen:
+                    seen.add(perm_key)
+                    rots = []
+                    if x:
+                        rots.append(("x", x))
+                    if y:
+                        rots.append(("y", y))
+                    if z:
+                        rots.append(("z", z))
+                    rotations.append(rots)
+    assert len(rotations) == 24, f"Expected 24 rotations, got {len(rotations)}"
+    return rotations
+
+
+def _compute_move_transform_table() -> list[dict[tuple[str, int], tuple[str, int]]]:
+    """For each of the 24 rotations, compute how each move (face, turns) transforms.
+
+    The transform is: map the face via the rotation's face permutation, keep
+    CW/CCW/HALF unchanged. This follows from proper rotations preserving
+    handedness (the conjugation R ∘ M ∘ R^{-1} preserves the turn direction
+    relative to the outward face normal).
+    """
+    rotations = _enumerate_24_rotations()
+    normal_to_face = {v: k for k, v in FACE_NORMALS.items()}
+    table: list[dict[tuple[str, int], tuple[str, int]]] = []
+
+    for rot in rotations:
+        move_map: dict[tuple[str, int], tuple[str, int]] = {}
+        for face in FACE_ORDER:
+            # Map the face normal under the rotation to find the new face
+            normal = FACE_NORMALS[face]
+            for axis, qt in rot:
+                normal = rotate_vec(normal, axis, qt)
+            new_face = normal_to_face[normal]
+            # Turns are preserved (proper rotation preserves handedness)
+            for turns in (1, -1, 2):
+                move_map[(face, turns)] = (new_face, turns)
+        table.append(move_map)
+    return table
+
+
+# Precomputed at import time (fast, ~0.1s)
+_ROTATIONS_24: list[list[tuple[str, int]]] | None = None
+_MOVE_TRANSFORM_TABLE: list[dict[tuple[str, int], tuple[str, int]]] | None = None
+
+
+def get_symmetry_rotations() -> list[list[tuple[str, int]]]:
+    """Get the 24 rotational symmetries. Cached."""
+    global _ROTATIONS_24
+    if _ROTATIONS_24 is None:
+        _ROTATIONS_24 = _enumerate_24_rotations()
+    return _ROTATIONS_24
+
+
+def get_move_transform_table() -> list[dict[tuple[str, int], tuple[str, int]]]:
+    """Get the move transformation table for all 24 rotations. Cached."""
+    global _MOVE_TRANSFORM_TABLE
+    if _MOVE_TRANSFORM_TABLE is None:
+        _MOVE_TRANSFORM_TABLE = _compute_move_transform_table()
+    return _MOVE_TRANSFORM_TABLE
+
+
+def transform_move(move: Move, rotation_idx: int) -> Move:
+    """Transform a move under one of the 24 rotational symmetries."""
+    table = get_move_transform_table()
+    new_face, new_turns = table[rotation_idx][(move.face, move.turns)]
+    return Move(face=new_face, depth=move.depth, width=move.width, turns=new_turns)
+
+
+def transform_episode(episode: Episode, rotation_idx: int) -> Episode:
+    """Transform an entire episode (scramble + solution) under a rotational symmetry.
+
+    The transformation maps each move M -> R(M) such that:
+      R(M)(solved) = R(M(solved))
+
+    This means: applying R(scramble) to solved gives R(scrambled_state),
+    and applying R(solution) then gives R(solved) = solved (for 2x2, uniform faces).
+    """
+    if rotation_idx == 0:
+        # Identity rotation (first in the list)
+        return episode
+    new_scramble = tuple(transform_move(m, rotation_idx) for m in episode.scramble)
+    new_solution = tuple(transform_move(m, rotation_idx) for m in episode.solution)
+    return Episode(
+        size=episode.size,
+        scramble=new_scramble,
+        solution=new_solution,
+        max_rollout_steps=episode.max_rollout_steps,
+    )
+
+
 def make_episode(
     size: int,
     rng: random.Random,

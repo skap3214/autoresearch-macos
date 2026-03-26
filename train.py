@@ -17,6 +17,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 
+import wandb
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -691,6 +692,30 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
+# Initialize wandb
+wandb.init(
+    project="rubiks-cube-solver",
+    config={
+        "depth": DEPTH,
+        "n_embd": config.n_embd,
+        "n_head": config.n_head,
+        "device_batch_size": DEVICE_BATCH_SIZE,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "matrix_lr": MATRIX_LR,
+        "embedding_lr": EMBEDDING_LR,
+        "weight_decay": WEIGHT_DECAY,
+        "warmup_ratio": WARMUP_RATIO,
+        "warmdown_ratio": WARMDOWN_RATIO,
+        "time_budget": TIME_BUDGET,
+        "train_seq_len": TRAIN_SEQ_LEN,
+        "max_seq_len": MAX_SEQ_LEN,
+        "head_dim": HEAD_DIM,
+        "patience": PATIENCE,
+    },
+    name=run_dir.name,
+    dir=str(run_dir),
+)
+
 summary_base = {
     "status": "running",
     "started_at": now_iso(),
@@ -1062,6 +1087,17 @@ while True:
     metrics_file.flush()
     loss_history.append((step, debiased_smooth_loss))
 
+    # wandb logging (every 100 steps to avoid overhead)
+    if step % 100 == 0:
+        wandb.log({
+            "train/loss": debiased_smooth_loss,
+            "train/lr_multiplier": lrm,
+            "train/tok_per_sec": tok_per_sec,
+            "train/mfu_percent": mfu,
+            "train/epoch": epoch,
+            "train/progress": progress,
+        }, step=step)
+
     # Periodic validation loss
     if step > 0 and step % VAL_EVERY == 0:
         val_loss = compute_val_loss(model, val_loader)
@@ -1087,6 +1123,12 @@ while True:
             marker = f" [no improve x{patience_counter}]"
 
         print(f"\n  val_loss: {val_loss:.4f} | train_loss: {debiased_smooth_loss:.4f} | gap: {val_loss - debiased_smooth_loss:.4f}{marker}")
+        wandb.log({
+            "val/loss": val_loss,
+            "val/train_gap": val_loss - debiased_smooth_loss,
+            "val/best_loss": best_val_loss,
+            "val/patience": patience_counter,
+        }, step=step)
 
         # Early stopping
         if patience_counter >= PATIENCE and progress > 0.5:
@@ -1099,6 +1141,9 @@ while True:
         solve_results = quick_solve_eval(model, tokenizer, QUICK_EVAL_CUBES)
         parts = [f"{s}x{s}:{r:.0%}" for s, r in sorted(solve_results.items())]
         print(f" {' | '.join(parts)}")
+        wandb.log({
+            **{f"eval/greedy_{s}x{s}": r for s, r in solve_results.items()},
+        }, step=step)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -1249,3 +1294,18 @@ with open(summary_json_path, "w", encoding="utf-8") as f:
 print(f"metrics_csv:      {metrics_csv_path}")
 print(f"loss_plot:        {loss_plot_path}")
 print(f"summary_json:     {summary_json_path}")
+
+# Log final metrics to wandb
+wandb.log({
+    "final/primary_metric": eval_metrics["primary_metric"],
+    "final/id_solve_rate": eval_metrics["id_solve_rate"],
+    "final/id_move_accuracy": eval_metrics["id_move_accuracy"],
+    "final/training_seconds": total_training_time,
+    "final/num_steps": step,
+    "final/peak_vram_mb": peak_vram_mb,
+    "final/mfu_percent": steady_state_mfu,
+})
+for split_name, metrics in eval_metrics["size_metrics"].items():
+    for size, stats in (metrics or {}).items():
+        wandb.log({f"final/{split_name}_{size}x{size}_solve": stats["solve_rate"]})
+wandb.finish()

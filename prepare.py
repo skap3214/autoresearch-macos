@@ -34,6 +34,8 @@ from rubiks import (
     parse_answer_tokens,
     random_scramble,
     scramble_length_for_size,
+    get_symmetry_rotations,
+    transform_episode,
 )
 from teacher_dwalton import solve_cube_222, solve_cube_333
 # Lazy imports — not used in data generation, avoid import-time crashes
@@ -45,7 +47,7 @@ from teacher_dwalton import solve_cube_222, solve_cube_333
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 74
-TIME_BUDGET = 86400  # 24 hours — no time pressure, train until converged
+TIME_BUDGET = 43200  # 12 hours — generous with 24x symmetry augmented data
 TEACHER_BACKEND = "dwalton76/rubiks-cube-NxNxN-solver"
 PROMPT_FORMAT_VERSION = "flat24-history3-jointmove-kociemba-v2"
 
@@ -55,7 +57,7 @@ OOD_DEV_SIZES = ()
 OOD_TEST_SIZES = ()
 
 TRAIN_EPISODES_PER_SIZE = 65536  # base
-_TRAIN_EPISODES_OVERRIDE = {3: 262144}  # 4x base, 2x previous — paired with 6hr budget
+_TRAIN_EPISODES_OVERRIDE = {3: 131072}  # 2x base; 24x symmetry aug gives 94M effective examples
 ID_VAL_EPISODES_PER_SIZE = 256
 OOD_DEV_EPISODES_PER_SIZE = 0
 OOD_TEST_EPISODES_PER_SIZE = 0
@@ -68,6 +70,11 @@ TRAIN_RNG_SEED = 42
 VAL_RNG_SEED = 99
 TRAIN_USE_CURRICULUM = False
 TRAIN_CURRICULUM_SCRAMBLE_LENGTHS = (2, 4, 6, 8, 10, 14, 18)
+
+# Symmetry augmentation: apply N of the 24 cube rotational symmetries to each episode.
+# 0 = no augmentation (just original), 24 = full augmentation (24x data).
+# Each rotation produces a valid but distinct training example from the same episode.
+SYMMETRY_AUGMENTATION_COUNT = 1  # no pre-computed aug; online augmentation in dataloader instead
 
 ROLLOUT_MIN_STEPS = 200
 SEARCH_SELECTOR = "hybrid_greedy_v1"  # fast eval; value-guided tested post-hoc
@@ -98,8 +105,9 @@ DATA_CONFIG = {
     "val_rng_seed": VAL_RNG_SEED,
     "train_use_curriculum": TRAIN_USE_CURRICULUM,
     "train_curriculum_scramble_lengths": TRAIN_CURRICULUM_SCRAMBLE_LENGTHS,
+    "symmetry_augmentation_count": SYMMETRY_AUGMENTATION_COUNT,
 }
-DATA_VERSION = _stable_version("rubiks-v8", DATA_CONFIG)
+DATA_VERSION = _stable_version("rubiks-v9", DATA_CONFIG)
 
 
 def get_experiment_manifest() -> dict[str, object]:
@@ -336,6 +344,22 @@ def episode_to_examples(tokenizer: Tokenizer, episode: Episode) -> list[dict[str
     return examples
 
 
+def _augment_one_worker(args):
+    """Module-level worker for parallel symmetry augmentation + tokenization."""
+    import sys
+    solver_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rubiks-cube-NxNxN-solver")
+    if os.path.exists(solver_root) and solver_root not in sys.path:
+        sys.path.insert(0, solver_root)
+    episode_dict, rot_idx = args
+    episode = Episode.from_dict(episode_dict)
+    aug_episode = transform_episode(episode, rot_idx)
+    tokenizer = Tokenizer(
+        token_to_id={token: idx for idx, token in enumerate(build_vocab())},
+        id_to_token=build_vocab(),
+    )
+    return episode_to_examples(tokenizer, aug_episode)
+
+
 def _generate_one_worker(args):
     """Module-level worker for parallel episode generation."""
     import sys
@@ -485,6 +509,12 @@ def build_dataset_payload(force: bool = False):
             episodes = pool.map(_generate_one_worker, args, chunksize=max(1, count // (n_workers * 4)))
         return episodes
 
+    # Determine which symmetry rotation indices to use
+    n_sym = min(SYMMETRY_AUGMENTATION_COUNT, 24)
+    sym_indices = list(range(n_sym))  # 0 = identity, 1-23 = rotations
+    if n_sym > 0:
+        print(f"  Symmetry augmentation: {n_sym}x (using {n_sym} of 24 rotations)")
+
     for size in TRAIN_SIZES:
         n_episodes = _TRAIN_EPISODES_OVERRIDE.get(size, TRAIN_EPISODES_PER_SIZE)
         episodes = generate_episode_batch(
@@ -493,8 +523,27 @@ def build_dataset_payload(force: bool = False):
             rng=train_rng,
             curriculum=TRAIN_USE_CURRICULUM,
         )
-        for episode in episodes:
-            train_examples.extend(episode_to_examples(tokenizer, episode))
+        if n_sym <= 1:
+            # No augmentation — sequential (fast enough)
+            for episode in episodes:
+                train_examples.extend(episode_to_examples(tokenizer, episode))
+        else:
+            # Parallel augmentation + tokenization
+            from multiprocessing import Pool, cpu_count
+            aug_args = [
+                (episode.to_dict(), rot_idx)
+                for episode in episodes
+                for rot_idx in sym_indices
+            ]
+            n_workers = min(cpu_count(), 16)
+            total = len(aug_args)
+            print(f"  Augmenting {len(episodes)} episodes x {n_sym} rotations = {total} tasks with {n_workers} workers...")
+            with Pool(n_workers) as pool:
+                for i, examples in enumerate(pool.imap_unordered(_augment_one_worker, aug_args, chunksize=256)):
+                    train_examples.extend(examples)
+                    if (i + 1) % 50000 == 0:
+                        print(f"    {i+1}/{total} augmented ({len(train_examples):,} examples so far)")
+            print(f"    Done: {len(train_examples):,} train examples for size {size}")
 
     for size in ID_VAL_SIZES:
         episodes = generate_episode_batch(size, ID_VAL_EPISODES_PER_SIZE, rng=val_rng)
@@ -560,6 +609,213 @@ def _example_stream(examples: list[dict[str, object]], shuffle: bool):
         epoch += 1
 
 
+# ---------------------------------------------------------------------------
+# Online symmetry augmentation — precomputed tables
+# ---------------------------------------------------------------------------
+
+_STICKER_PERMS: dict[int, list[list[int]]] | None = None
+_MOVE_TOKEN_MAP: list[dict[int, int]] | None = None
+
+
+def _build_sticker_permutation(size: int, rot_idx: int) -> list[int]:
+    """Compute how flat sticker indices permute under rotation rot_idx.
+    Returns perm where: rotated_stickers[i] = original_stickers[perm[i]]."""
+    from rubiks import Cube, _apply_whole_cube_rotation, get_symmetry_rotations, FACE_ORDER
+    rotations = get_symmetry_rotations()
+    rot = rotations[rot_idx]
+    n_stickers = 6 * size * size
+
+    # Create a cube with unique "colors" at each position to track permutation
+    solved = Cube(size)
+    # Assign unique IDs via sticker dict — read flat order to get original indices
+    orig_flat = []
+    for face in FACE_ORDER:
+        for row in solved.face_grid(face):
+            orig_flat.extend(row)
+
+    # Apply rotation
+    rotated = solved.copy()
+    for axis, qt in rot:
+        rotated = _apply_whole_cube_rotation(rotated, axis, qt)
+
+    rot_flat = []
+    for face in FACE_ORDER:
+        for row in rotated.face_grid(face):
+            rot_flat.extend(row)
+
+    # Build permutation: for each position in rotated, find where that color
+    # came from in the original. Since solved has fixed colors per face, we need
+    # a different approach — use position tracking instead.
+
+    # Better: create cube with unique marker per sticker position
+    # We'll use the sticker (position, normal) keys directly
+    solved2 = Cube(size)
+    # Map each sticker to its flat index
+    sticker_to_idx = {}
+    idx = 0
+    for face in FACE_ORDER:
+        normal = solved2._get_face_normal(face) if hasattr(solved2, '_get_face_normal') else None
+        from rubiks import FACE_NORMALS, FACE_VIEW_BASIS, _dot
+        normal = FACE_NORMALS[face]
+        up_vec, right_vec = FACE_VIEW_BASIS[face]
+        for r in range(size):
+            for c in range(size):
+                sticker_to_idx[(face, r, c)] = idx
+                idx += 1
+
+    # For the rotated cube, figure out which original (face, r, c) maps to each
+    # new (face, r, c) position
+    from rubiks import rotate_vec
+    perm = [0] * n_stickers
+    for (position, normal_vec), color in solved2.stickers.items():
+        # Rotate this sticker
+        new_pos = position
+        new_norm = normal_vec
+        for axis, qt in rot:
+            new_pos = rotate_vec(new_pos, axis, qt)
+            new_norm = rotate_vec(new_norm, axis, qt)
+
+        # Find which face the rotated normal belongs to
+        new_face = None
+        for f, fn in FACE_NORMALS.items():
+            if fn == new_norm:
+                new_face = f
+                break
+
+        # Find (row, col) in the new face
+        up_vec, right_vec = FACE_VIEW_BASIS[new_face]
+        row_val = -_dot(new_pos, up_vec)
+        col_val = _dot(new_pos, right_vec)
+        new_r = (row_val + (size - 1)) // 2
+        new_c = (col_val + (size - 1)) // 2
+
+        # Find original (face, r, c)
+        orig_face = None
+        for f, fn in FACE_NORMALS.items():
+            if fn == normal_vec:
+                orig_face = f
+                break
+        orig_up, orig_right = FACE_VIEW_BASIS[orig_face]
+        orig_row_val = -_dot(position, orig_up)
+        orig_col_val = _dot(position, orig_right)
+        orig_r = (orig_row_val + (size - 1)) // 2
+        orig_c = (orig_col_val + (size - 1)) // 2
+
+        orig_idx = sticker_to_idx[(orig_face, orig_r, orig_c)]
+        new_idx = sticker_to_idx[(new_face, new_r, new_c)]
+        perm[new_idx] = orig_idx
+
+    return perm
+
+
+def _build_move_token_map(tokenizer: Tokenizer) -> list[dict[int, int]]:
+    """For each of 24 rotations, map move token IDs to transformed token IDs."""
+    from rubiks import get_move_transform_table, FACE_ORDER
+    table = get_move_transform_table()
+    turn_names = {1: "CW", -1: "CCW", 2: "HALF"}
+    maps = []
+    for rot_idx in range(24):
+        token_map = {}
+        for face in FACE_ORDER:
+            for turns, tname in turn_names.items():
+                orig_token = f"MOVE_{face}_{tname}"
+                new_face, new_turns = table[rot_idx][(face, turns)]
+                new_token = f"MOVE_{new_face}_{turn_names[new_turns]}"
+                orig_id = tokenizer.token_to_id[orig_token]
+                new_id = tokenizer.token_to_id[new_token]
+                token_map[orig_id] = new_id
+        maps.append(token_map)
+    return maps
+
+
+_COLOR_TOKEN_MAP: list[dict[int, int]] | None = None
+
+
+def _build_color_token_map(tokenizer: Tokenizer) -> list[dict[int, int]]:
+    """For each of 24 rotations, map color token IDs to relabeled color token IDs.
+    Under rotation R, face X maps to face Y, so COL_{color_of_X} → COL_{color_of_Y}."""
+    from rubiks import get_symmetry_rotations, FACE_ORDER, FACE_NORMALS, FACE_COLORS, rotate_vec
+    rotations = get_symmetry_rotations()
+    normal_to_face = {v: k for k, v in FACE_NORMALS.items()}
+    maps = []
+    for rot_idx in range(24):
+        rot = rotations[rot_idx]
+        token_map = {}
+        for face in FACE_ORDER:
+            normal = FACE_NORMALS[face]
+            for axis, qt in rot:
+                normal = rotate_vec(normal, axis, qt)
+            new_face = normal_to_face[normal]
+            orig_color = FACE_COLORS[face]
+            new_color = FACE_COLORS[new_face]
+            orig_id = tokenizer.token_to_id[f"COL_{orig_color}"]
+            new_id = tokenizer.token_to_id[f"COL_{new_color}"]
+            token_map[orig_id] = new_id
+        maps.append(token_map)
+    return maps
+
+
+def _get_augmentation_tables(tokenizer: Tokenizer):
+    """Lazy-init and return (sticker_perms, move_token_maps, color_token_maps)."""
+    global _STICKER_PERMS, _MOVE_TOKEN_MAP, _COLOR_TOKEN_MAP
+    if _STICKER_PERMS is None:
+        _STICKER_PERMS = {}
+        for size in (2, 3):
+            _STICKER_PERMS[size] = [_build_sticker_permutation(size, r) for r in range(24)]
+        _MOVE_TOKEN_MAP = _build_move_token_map(tokenizer)
+        _COLOR_TOKEN_MAP = _build_color_token_map(tokenizer)
+    return _STICKER_PERMS, _MOVE_TOKEN_MAP, _COLOR_TOKEN_MAP
+
+
+def _augment_example_online(input_ids: list[int], target_ids: list[int],
+                            size: int, rot_idx: int,
+                            sticker_perms: dict, move_maps: list,
+                            color_maps: list) -> tuple[list[int], list[int]]:
+    """Apply rotation rot_idx to a single tokenized example.
+
+    Three transformations:
+    1. Permute sticker positions (which physical position maps where)
+    2. Relabel sticker colors (W→G if U face maps to F face)
+    3. Transform move tokens (face label mapping)
+    """
+    if rot_idx == 0:
+        return input_ids, target_ids
+
+    n_stickers = 6 * size * size
+    perm = sticker_perms[size][rot_idx]
+    move_map = move_maps[rot_idx]
+    color_map = color_maps[rot_idx]
+
+    # Find sticker start position
+    # 2x2: [BOS, TASK_POLICY, SIZE, DIGIT_N, /SIZE, stickers...]  → start=5
+    # 3x3: [BOS, TASK_POLICY, SIZE, DIGIT_N, /SIZE, STAGE_X, stickers...] → start=6
+    sticker_start = 6 if size >= 3 else 5
+    sticker_end = sticker_start + n_stickers
+
+    new_input = list(input_ids)
+    new_target = list(target_ids)
+
+    # 1. Permute sticker positions, 2. Relabel colors
+    if sticker_end <= len(new_input):
+        orig_stickers = input_ids[sticker_start:sticker_end]
+        for i, src in enumerate(perm):
+            token_id = orig_stickers[src]
+            # Relabel color after permuting position
+            new_input[sticker_start + i] = color_map.get(token_id, token_id)
+
+    # 3. Transform move tokens in input (history moves after stickers)
+    for i in range(sticker_end, len(new_input)):
+        if new_input[i] in move_map:
+            new_input[i] = move_map[new_input[i]]
+
+    # 3. Transform answer token in targets
+    for i in range(len(new_target)):
+        if new_target[i] in move_map:
+            new_target[i] = move_map[new_target[i]]
+
+    return new_input, new_target
+
+
 def make_dataloader(tokenizer: Tokenizer, B: int, T: int, split: str):
     if split not in {"train", "val", "ood_val"}:
         raise ValueError(f"Unsupported split: {split}")
@@ -573,6 +829,14 @@ def make_dataloader(tokenizer: Tokenizer, B: int, T: int, split: str):
     else:
         examples = payload["ood_dev_examples"]
         shuffle = False
+
+    # Online symmetry augmentation (train split only)
+    use_augmentation = (split == "train") and SYMMETRY_AUGMENTATION_COUNT <= 1
+    sticker_perms = move_maps = color_maps = None
+    if use_augmentation:
+        sticker_perms, move_maps, color_maps = _get_augmentation_tables(tokenizer)
+        print(f"  Online symmetry augmentation: enabled (24 rotations per example)")
+    aug_rng = random.Random(12345)
 
     stream = _example_stream(examples, shuffle=shuffle)
     device = get_runtime_device()
@@ -590,6 +854,17 @@ def make_dataloader(tokenizer: Tokenizer, B: int, T: int, split: str):
             example, epoch = next(stream)
             input_ids = example["input_ids"]
             target_ids = example["targets"]
+
+            # Apply random rotation (online augmentation)
+            if use_augmentation:
+                size = example.get("size", 2)
+                rot_idx = aug_rng.randint(0, 23)
+                if size in sticker_perms:
+                    input_ids, target_ids = _augment_example_online(
+                        input_ids, target_ids, size, rot_idx,
+                        sticker_perms, move_maps, color_maps
+                    )
+
             seq_len = min(len(input_ids), T)
             cpu_inputs[row_idx].fill_(pad_id)
             cpu_targets[row_idx].fill_(-1)
