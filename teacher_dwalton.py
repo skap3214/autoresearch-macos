@@ -30,24 +30,45 @@ def _ensure_solver_importable():
 
 
 def _parse_basic_step(step: str) -> Move:
-    if step not in {
+    _BASIC_MOVES = {
         "U", "U'", "U2",
         "R", "R'", "R2",
         "F", "F'", "F2",
         "D", "D'", "D2",
         "L", "L'", "L2",
         "B", "B'", "B2",
-    }:
-        raise ValueError(f"Unsupported teacher move for current curriculum: {step}")
+    }
+    _WIDE_MOVES = {
+        "Uw", "Uw'", "Uw2",
+        "Rw", "Rw'", "Rw2",
+        "Fw", "Fw'", "Fw2",
+        "Dw", "Dw'", "Dw2",
+        "Lw", "Lw'", "Lw2",
+        "Bw", "Bw'", "Bw2",
+    }
 
-    face = step[0]
-    if step.endswith("2"):
-        turns = 2
-    elif step.endswith("'"):
-        turns = -1
-    else:
-        turns = 1
-    return Move(face=face, depth=1, width=1, turns=turns)
+    if step in _BASIC_MOVES:
+        face = step[0]
+        if step.endswith("2"):
+            turns = 2
+        elif step.endswith("'"):
+            turns = -1
+        else:
+            turns = 1
+        return Move(face=face, depth=1, width=1, turns=turns)
+
+    if step in _WIDE_MOVES:
+        face = step[0]
+        suffix = step[2:]  # after "Xw"
+        if suffix == "2":
+            turns = 2
+        elif suffix == "'":
+            turns = -1
+        else:
+            turns = 1
+        return Move(face=face, depth=1, width=2, turns=turns)
+
+    raise ValueError(f"Unsupported teacher move for current curriculum: {step}")
 
 
 def _solve_cube(cube: Cube, solver_class, goal_check) -> tuple[Move, ...]:
@@ -84,3 +105,11 @@ def solve_cube_333(cube: Cube) -> tuple[Move, ...]:
 
     from rubikscubennnsolver.RubiksCube333 import RubiksCube333
     return _solve_cube(cube, RubiksCube333, lambda c: c.is_solved())
+
+
+def solve_cube_444(cube: Cube) -> tuple[Move, ...]:
+    if cube.size != 4:
+        raise ValueError(f"solve_cube_444 only supports 4x4, got {cube.size}")
+
+    from rubikscubennnsolver.RubiksCube444 import RubiksCube444
+    return _solve_cube(cube, RubiksCube444, lambda c: c.is_solved())

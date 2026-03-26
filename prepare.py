@@ -37,7 +37,7 @@ from rubiks import (
     get_symmetry_rotations,
     transform_episode,
 )
-from teacher_dwalton import solve_cube_222, solve_cube_333
+from teacher_dwalton import solve_cube_222, solve_cube_333, solve_cube_444
 # Lazy imports — not used in data generation, avoid import-time crashes
 # from teacher_cfop import solve_cube_333_cfop
 # from teacher_pycuber import solve_cube_333_pycuber
@@ -46,18 +46,18 @@ from teacher_dwalton import solve_cube_222, solve_cube_333
 # Constants (fixed for v1)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 74
+MAX_SEQ_LEN = 120
 TIME_BUDGET = 43200  # 12 hours — generous with 24x symmetry augmented data
 TEACHER_BACKEND = "dwalton76/rubiks-cube-NxNxN-solver"
 PROMPT_FORMAT_VERSION = "flat24-history3-jointmove-kociemba-v2"
 
-TRAIN_SIZES = (2, 3)
+TRAIN_SIZES = (2, 3, 4)
 ID_VAL_SIZES = TRAIN_SIZES
 OOD_DEV_SIZES = ()
 OOD_TEST_SIZES = ()
 
 TRAIN_EPISODES_PER_SIZE = 65536  # base
-_TRAIN_EPISODES_OVERRIDE = {3: 131072}  # 2x base; 24x symmetry aug gives 94M effective examples
+_TRAIN_EPISODES_OVERRIDE = {3: 131072, 4: 65536}  # 2x base for 3x3; 4x4 starts at base
 ID_VAL_EPISODES_PER_SIZE = 256
 OOD_DEV_EPISODES_PER_SIZE = 0
 OOD_TEST_EPISODES_PER_SIZE = 0
@@ -395,6 +395,14 @@ def generate_teacher_episode(size: int, rng: random.Random, scramble_length: int
     elif size == 3:
         # Kociemba teacher: short ~20-move solutions, best for beam search
         solution = solve_cube_333(cube)
+        return Episode(
+            size=size,
+            scramble=scramble,
+            solution=solution,
+            max_rollout_steps=max(8, len(solution) * 2),
+        )
+    elif size == 4:
+        solution = solve_cube_444(cube)
         return Episode(
             size=size,
             scramble=scramble,
@@ -760,7 +768,7 @@ def _get_augmentation_tables(tokenizer: Tokenizer):
     global _STICKER_PERMS, _MOVE_TOKEN_MAP, _COLOR_TOKEN_MAP
     if _STICKER_PERMS is None:
         _STICKER_PERMS = {}
-        for size in (2, 3):
+        for size in (2, 3, 4):
             _STICKER_PERMS[size] = [_build_sticker_permutation(size, r) for r in range(24)]
         _MOVE_TOKEN_MAP = _build_move_token_map(tokenizer)
         _COLOR_TOKEN_MAP = _build_color_token_map(tokenizer)

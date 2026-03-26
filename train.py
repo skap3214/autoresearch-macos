@@ -129,14 +129,26 @@ def _get_color_map(tokenizer) -> dict[int, int]:
         }
     return _COLOR_TOKEN_MAP
 
-def _extract_stickers_from_batch(input_ids: torch.Tensor, tokenizer) -> torch.Tensor:
-    """Extract 24 sticker color indices from input_ids batch. Stickers at positions 5-28."""
+def _extract_stickers_from_batch(input_ids: torch.Tensor, tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract 24 sticker color indices from 2x2 examples in the batch.
+
+    Returns (stickers, mask) where mask indicates which rows are 2x2 cubes
+    (24 stickers at positions 5-28). Non-2x2 rows (3x3, 4x4, etc.) are excluded
+    since the ValueMLP is sized for 24 stickers only.
+    """
     color_map = _get_color_map(tokenizer)
+    color_token_ids = set(color_map.keys())
+    # 2x2 examples have a COL_ token at position 5 (no STAGE token);
+    # 3x3+ examples have a STAGE_ token at position 5.
+    is_2x2 = torch.tensor(
+        [int(input_ids[i, 5].item() in color_token_ids) for i in range(input_ids.size(0))],
+        dtype=torch.bool, device=input_ids.device,
+    )
     sticker_tokens = input_ids[:, 5:29]  # (B, 24) COL_X token IDs
     stickers = torch.zeros_like(sticker_tokens)
     for token_id, color_idx in color_map.items():
         stickers[sticker_tokens == token_id] = color_idx
-    return stickers
+    return stickers, is_2x2
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -625,8 +637,8 @@ ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention (4 heads for more diverse patterns)
 WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 
-# Sequence length for training (3x3: 54 stickers + 5 markers + 1 stage + 3 history + 1 answer ≈ 65 tokens)
-TRAIN_SEQ_LEN = 66
+# Sequence length for training (4x4: 96 stickers + 5 markers + 1 stage + 3 history + 1 answer ≈ 107 tokens)
+TRAIN_SEQ_LEN = 120
 
 # Optimization
 TOTAL_BATCH_SIZE = 67584  # = 1024 * 66, maximize A100 utilization
@@ -862,16 +874,18 @@ from prepare import (
     get_runtime_device,
 )
 from rubiks import Cube, build_prompt_tokens, build_answer_tokens, random_scramble, scramble_length_for_size
-from teacher_dwalton import solve_cube_222, solve_cube_333
+from teacher_dwalton import solve_cube_222, solve_cube_333, solve_cube_444
 import random as _random
 
-DAGGER_TRAIN_SIZES = (2, 3)
+DAGGER_TRAIN_SIZES = (2, 3, 4)
 
 def _solve_cube_any(cube):
     if cube.size == 2:
         return solve_cube_222(cube)
     elif cube.size == 3:
         return solve_cube_333(cube)
+    elif cube.size == 4:
+        return solve_cube_444(cube)
     raise NotImplementedError(f"No solver for size {cube.size}")
 
 def _is_goal(cube):
@@ -1026,12 +1040,14 @@ while True:
     model.zero_grad(set_to_none=True)
 
     # Train value MLP on same batch (fast, negligible overhead)
-    stickers = _extract_stickers_from_batch(x, tokenizer)
-    mlp_pred = value_mlp(stickers)
-    mlp_loss = F.mse_loss(mlp_pred, d)
-    mlp_loss.backward()
-    value_mlp_optimizer.step()
-    value_mlp_optimizer.zero_grad()
+    # Only train on 2x2 examples (24 stickers); skip 3x3/4x4 which have different sticker counts
+    stickers, is_2x2 = _extract_stickers_from_batch(x, tokenizer)
+    if is_2x2.any():
+        mlp_pred = value_mlp(stickers[is_2x2])
+        mlp_loss = F.mse_loss(mlp_pred, d[is_2x2])
+        mlp_loss.backward()
+        value_mlp_optimizer.step()
+        value_mlp_optimizer.zero_grad()
 
     train_loss_f = train_loss.item()
 

@@ -18,3 +18,12 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+
+# 4x4+ solver artifacts
+ida_search_via_graph
+lookup-tables/
+
+# Run artifacts
+runs/
+run.log
+datagen.log
