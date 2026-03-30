@@ -330,9 +330,10 @@ def select_move(model, tokenizer, cube, history, visited_states):
 def load_checkpoint(path, device="cpu"):
     print(f"Loading checkpoint from {path}...")
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    config = GPTConfig(**checkpoint['config'])
+    raw_config = checkpoint['config']
+    config = raw_config if isinstance(raw_config, GPTConfig) else GPTConfig(**raw_config)
     model = GPT(config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.to(device)
     model.eval()
 

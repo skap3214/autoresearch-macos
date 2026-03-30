@@ -298,10 +298,10 @@ def detect_cfop_stage(cube: Cube) -> str:
     """Detect which CFOP stage a 3x3 cube is in, checking from solved backwards.
 
     Returns one of: "CROSS", "F2L", "OLL", "PLL", "SOLVED".
-    For 2x2, always returns "CROSS" (no meaningful CFOP stages).
+    Only valid for 3x3. Raises ValueError for other sizes.
     """
-    if cube.size < 3:
-        return "CROSS"
+    if cube.size != 3:
+        raise ValueError(f"CFOP stage detection is only valid for 3x3, got {cube.size}x{cube.size}")
 
     if cube.is_solved():
         return "SOLVED"
@@ -354,10 +354,12 @@ def detect_cfop_stage(cube: Cube) -> str:
 
 def build_prompt_tokens(size: int, cube: Cube, history: list[Move] | None = None) -> list[str]:
     tokens = ["<TASK_POLICY>", "<SIZE>", *int_to_digit_tokens(size), "</SIZE>"]
-    # Add CFOP stage for 3x3
-    if size >= 3:
+    # Add stage token: CFOP for 3x3, reduction for 4x4
+    if size == 3:
         stage = detect_cfop_stage(cube)
         tokens.append(f"STAGE_{stage}")
+    elif size == 4:
+        tokens.append(reduction_stage_444_token(cube))
     # Flat sticker colors in fixed face/row/col order (URFDLB)
     for face in FACE_ORDER:
         for row in cube.face_grid(face):
@@ -365,16 +367,18 @@ def build_prompt_tokens(size: int, cube: Cube, history: list[Move] | None = None
     # Last few moves as action history (reduces oscillation)
     if history:
         for move in history[-3:]:
-            tokens.append(f"MOVE_{move.face}_{move.turn_name()}")
+            prefix = "WMOVE" if move.width >= 2 else "MOVE"
+            tokens.append(f"{prefix}_{move.face}_{move.turn_name()}")
     tokens.append("<TARGET>")
     return tokens
 
 
 def build_answer_tokens(move: Move | None) -> list[str]:
-    """Single-token answer: MOVE_face_turn or <DONE>."""
+    """Single-token answer: MOVE_face_turn, WMOVE_face_turn, or <DONE>."""
     if move is None:
         return ["<DONE>"]
-    return [f"MOVE_{move.face}_{move.turn_name()}"]
+    prefix = "WMOVE" if move.width >= 2 else "MOVE"
+    return [f"{prefix}_{move.face}_{move.turn_name()}"]
 
 
 def parse_answer_tokens(tokens: list[str]) -> Move | None:
@@ -382,13 +386,19 @@ def parse_answer_tokens(tokens: list[str]) -> Move | None:
         raise ValueError("Cannot parse empty answer token list")
     if tokens[0] == "<DONE>":
         return None
+    if tokens[0].startswith("WMOVE_"):
+        parts = tokens[0].split("_")
+        face = parts[1]
+        turn_name = parts[2]
+        turns = {"CW": 1, "CCW": -1, "HALF": 2}[turn_name]
+        return Move(face=face, depth=1, width=2, turns=turns)
     if tokens[0].startswith("MOVE_"):
         parts = tokens[0].split("_")
         face = parts[1]
         turn_name = parts[2]
         turns = {"CW": 1, "CCW": -1, "HALF": 2}[turn_name]
         return Move(face=face, depth=1, width=1, turns=turns)
-    raise ValueError(f"Expected MOVE_* or <DONE>, got {tokens[0]}")
+    raise ValueError(f"Expected MOVE_*/WMOVE_* or <DONE>, got {tokens[0]}")
 
 
 def build_subgoal_training_examples(
@@ -516,6 +526,169 @@ def random_scramble(
 
 def scramble_length_for_size(size: int) -> int:
     return 6 + size * 4
+
+
+# ---------------------------------------------------------------------------
+# 4x4 progress metrics — reduction stage detection
+# ---------------------------------------------------------------------------
+
+def centers_done_444(cube: Cube) -> bool:
+    """Check if all 4 center stickers on each face are uniform (same color).
+    Uses within-face uniformity, not canonical colors, because 4x4 centers are movable."""
+    if cube.size != 4:
+        raise ValueError(f"centers_done_444 only valid for 4x4, got {cube.size}")
+    for face in FACE_ORDER:
+        grid = cube.face_grid(face)
+        # Center is the inner 2x2 block: grid[1][1], grid[1][2], grid[2][1], grid[2][2]
+        center_colors = {grid[1][1], grid[1][2], grid[2][1], grid[2][2]}
+        if len(center_colors) != 1:
+            return False
+    return True
+
+
+def paired_edge_count_444(cube: Cube) -> int:
+    """Count how many of the 12 logical edges have their wing pair matched.
+    A 4x4 has 24 wing cubies forming 12 edge pairs. Each pair is 'paired' if
+    the two wings that share a logical edge position have matching color sets."""
+    if cube.size != 4:
+        raise ValueError(f"paired_edge_count_444 only valid for 4x4, got {cube.size}")
+    limit = cube.limit  # = 3 for 4x4
+
+    # Group wing cubies by their edge key.
+    # A wing cubie has exactly 2 coordinates at ±limit and 1 inner coordinate.
+    edge_groups: dict[tuple, list[tuple[str, str]]] = {}
+    for (position, normal), color in cube.stickers.items():
+        # Check if this sticker is on a wing (edge) piece
+        at_limit = sum(1 for c in position if abs(c) == limit)
+        if at_limit != 2:
+            continue
+        # This is a wing sticker — group by edge key
+        edge_key = tuple(c if abs(c) == limit else 0 for c in position)
+        if edge_key not in edge_groups:
+            edge_groups[edge_key] = []
+        edge_groups[edge_key].append((color, normal))
+
+    # Each logical edge has 2 positions (inner coords differ).
+    # Group edge_keys that share the same limit coords but differ in inner coord.
+    edge_key_pairs: dict[tuple, list[tuple]] = {}
+    for ek in edge_groups:
+        # Canonical: sort by inner coord value
+        canonical = tuple(abs(c) if abs(c) == limit else 0 for c in ek)
+        if canonical not in edge_key_pairs:
+            edge_key_pairs[canonical] = []
+        edge_key_pairs[canonical].append(ek)
+
+    paired = 0
+    for canonical, keys in edge_key_pairs.items():
+        if len(keys) != 2:
+            continue
+        # Get the colors visible on each wing position (stickers facing outward)
+        colors_a = set()
+        colors_b = set()
+        for (color, normal) in edge_groups[keys[0]]:
+            colors_a.add(color)
+        for (color, normal) in edge_groups[keys[1]]:
+            colors_b.add(color)
+        if colors_a == colors_b:
+            paired += 1
+
+    return paired
+
+
+def edges_paired_444(cube: Cube) -> bool:
+    """Check if all 12 edge pairs are matched on a 4x4."""
+    return paired_edge_count_444(cube) == 12
+
+
+def reduction_stage_444(cube: Cube) -> int:
+    """Determine the reduction stage of a 4x4 cube.
+    Returns:
+        4 = fully solved
+        3 = reduced to 3x3 (centers done AND edges paired)
+        2 = edges paired only
+        1 = centers done only
+        0 = neither
+    """
+    if cube.size != 4:
+        raise ValueError(f"reduction_stage_444 only valid for 4x4, got {cube.size}")
+    if cube.is_solved():
+        return 4
+    cd = centers_done_444(cube)
+    ep = edges_paired_444(cube)
+    if cd and ep:
+        return 3
+    if ep:
+        return 2
+    if cd:
+        return 1
+    return 0
+
+
+_STAGE_444_TOKENS = {
+    0: "STAGE_444_UNREDUCED",
+    1: "STAGE_444_CENTERS",
+    2: "STAGE_444_EDGES",
+    3: "STAGE_444_REDUCED",
+    4: "STAGE_444_SOLVED",
+}
+
+
+def reduction_stage_444_token(cube: Cube) -> str:
+    """Get the stage token string for a 4x4 cube's current reduction stage."""
+    return _STAGE_444_TOKENS[reduction_stage_444(cube)]
+
+
+def build_reduction_training_examples_444(
+    scramble: tuple[Move, ...],
+    solution: tuple[Move, ...],
+) -> list[tuple[list[str], list[str], int]]:
+    """Build stage-local training examples for a 4x4 episode.
+
+    Walks the solution, detects stage boundaries using reduction_stage_444,
+    and assigns distance_to_goal as moves remaining until the next stage
+    transition (not total moves to solve).
+
+    Returns list of (prompt_tokens, answer_tokens, stage_local_distance).
+    """
+    cube = Cube(4)
+    cube.apply_moves(scramble)
+    examples: list[tuple[list[str], list[str], int]] = []
+    history: list[Move] = []
+
+    # First pass: find stage boundaries
+    sim = cube.copy()
+    stages_at_step = []
+    for move in solution:
+        stages_at_step.append(reduction_stage_444(sim))
+        sim.apply_move(move)
+    stages_at_step.append(reduction_stage_444(sim))  # final state
+
+    # Find next stage boundary for each step
+    n = len(solution)
+    next_boundary = [n] * n  # default: end of solution
+    current_boundary = n
+    for i in range(n - 1, -1, -1):
+        if i + 1 < len(stages_at_step) and stages_at_step[i + 1] != stages_at_step[i]:
+            current_boundary = i + 1
+        next_boundary[i] = current_boundary
+
+    # Second pass: build examples with stage-local distances
+    for i, move in enumerate(solution):
+        stage_local_dist = next_boundary[i] - i
+        prompt_tokens = build_prompt_tokens(4, cube, history=history)
+        answer_tokens = build_answer_tokens(move)
+        examples.append((prompt_tokens, answer_tokens, stage_local_dist))
+        cube.apply_move(move)
+        history.append(move)
+
+    # DONE token at end
+    examples.append((
+        build_prompt_tokens(4, cube, history=history),
+        build_answer_tokens(None),
+        0,
+    ))
+
+    return examples
 
 
 # ---------------------------------------------------------------------------

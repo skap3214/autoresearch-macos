@@ -46,18 +46,18 @@ from teacher_dwalton import solve_cube_222, solve_cube_333, solve_cube_444
 # Constants (fixed for v1)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 120
-TIME_BUDGET = 43200  # 12 hours — generous with 24x symmetry augmented data
+MAX_SEQ_LEN = 74  # 3x3 max ~66 tokens
+TIME_BUDGET = 21600  # 6 hours — proven for 3x3
 TEACHER_BACKEND = "dwalton76/rubiks-cube-NxNxN-solver"
-PROMPT_FORMAT_VERSION = "flat24-history3-jointmove-kociemba-v2"
+PROMPT_FORMAT_VERSION = "flat24-history3-jointmove-kociemba-v5-dagger"
 
-TRAIN_SIZES = (2, 3, 4)
+TRAIN_SIZES = (2, 3)  # 3x3 mainline with DAgger
 ID_VAL_SIZES = TRAIN_SIZES
 OOD_DEV_SIZES = ()
 OOD_TEST_SIZES = ()
 
-TRAIN_EPISODES_PER_SIZE = 65536  # base
-_TRAIN_EPISODES_OVERRIDE = {3: 131072, 4: 65536}  # 2x base for 3x3; 4x4 starts at base
+TRAIN_EPISODES_PER_SIZE = 65536
+_TRAIN_EPISODES_OVERRIDE = {3: 131072}  # 2x base for 3x3
 ID_VAL_EPISODES_PER_SIZE = 256
 OOD_DEV_EPISODES_PER_SIZE = 0
 OOD_TEST_EPISODES_PER_SIZE = 0
@@ -206,12 +206,22 @@ def build_vocab() -> list[str]:
     for face in ("U", "R", "F", "D", "L", "B"):
         for turn in ("CW", "CCW", "HALF"):
             tokens.append(f"MOVE_{face}_{turn}")
-    # CFOP stage-conditioning tokens
+    # Wide move tokens for 4x4+: WMOVE_{face}_{turn} (width=2)
+    for face in ("U", "R", "F", "D", "L", "B"):
+        for turn in ("CW", "CCW", "HALF"):
+            tokens.append(f"WMOVE_{face}_{turn}")
+    # CFOP stage-conditioning tokens (3x3)
     tokens.append("STAGE_CROSS")
     tokens.append("STAGE_F2L")
     tokens.append("STAGE_OLL")
     tokens.append("STAGE_PLL")
     tokens.append("STAGE_SOLVED")
+    # 4x4 reduction stage tokens
+    tokens.append("STAGE_444_UNREDUCED")
+    tokens.append("STAGE_444_CENTERS")
+    tokens.append("STAGE_444_EDGES")
+    tokens.append("STAGE_444_REDUCED")
+    tokens.append("STAGE_444_SOLVED")
     return tokens
 
 
@@ -296,6 +306,8 @@ def ensure_tokenizer(force: bool = False):
 
 
 def encode_supervised_example(tokenizer: Tokenizer, prompt_tokens: list[str], answer_tokens: list[str]) -> dict[str, object]:
+    # Filter out tokens not in vocab (e.g., STAGE tokens for 82-token models)
+    prompt_tokens = [t for t in prompt_tokens if t in tokenizer.token_to_id]
     prompt_ids = tokenizer.encode_tokens(prompt_tokens)
     answer_ids = tokenizer.encode_tokens(answer_tokens)
     full_ids = [tokenizer.get_bos_token_id(), *prompt_ids, *answer_ids]
@@ -329,6 +341,22 @@ def episode_to_examples(tokenizer: Tokenizer, episode: Episode) -> list[dict[str
                 examples.append(encoded)
             except (ValueError, AssertionError):
                 continue  # skip if sequence too long
+        return examples
+
+    # Use reduction-stage-local training for 4x4
+    if episode.size == 4:
+        from rubiks import build_reduction_training_examples_444
+        examples = []
+        for prompt_tokens, answer_tokens, distance in build_reduction_training_examples_444(
+            episode.scramble, episode.solution,
+        ):
+            try:
+                encoded = encode_supervised_example(tokenizer, prompt_tokens, answer_tokens)
+                encoded["size"] = episode.size
+                encoded["distance_to_goal"] = distance
+                examples.append(encoded)
+            except (ValueError, AssertionError):
+                continue
         return examples
 
     examples = []
@@ -368,18 +396,29 @@ def _generate_one_worker(args):
         sys.path.insert(0, solver_root)
     size, seed, scramble_length = args
     worker_rng = random.Random(seed)
-    return generate_teacher_episode(size=size, rng=worker_rng, scramble_length=scramble_length)
+    # Retry with different seeds if solver fails (4x4 lookup tables incomplete)
+    for attempt in range(5):
+        try:
+            return generate_teacher_episode(size=size, rng=worker_rng, scramble_length=scramble_length)
+        except Exception:
+            seed = seed + 1000000 + attempt
+            worker_rng = random.Random(seed)
+    # Last resort: return a trivial episode (solved cube, no moves)
+    return Episode(size=size, scramble=(), solution=(), max_rollout_steps=1)
 
 
-def generate_teacher_episode(size: int, rng: random.Random, scramble_length: int | None = None) -> Episode:
+def generate_teacher_episode(size: int, rng: random.Random, scramble_length: int | None = None,
+                             max_width: int | None = None) -> Episode:
     if scramble_length is None:
         scramble_length = scramble_length_for_size(size)
+    if max_width is None:
+        max_width = MAX_MOVE_WIDTH
     scramble = random_scramble(
         size=size,
         length=scramble_length,
         rng=rng,
         max_depth=MAX_MOVE_DEPTH,
-        max_width=MAX_MOVE_WIDTH,
+        max_width=max_width,
     )
     cube = Cube(size)
     cube.apply_moves(scramble)
@@ -402,7 +441,11 @@ def generate_teacher_episode(size: int, rng: random.Random, scramble_length: int
             max_rollout_steps=max(8, len(solution) * 2),
         )
     elif size == 4:
-        solution = solve_cube_444(cube)
+        # Self-supervised: solution = inverse of scramble (no solver needed)
+        # EfficientCube proved this approach works — suboptimal solutions but
+        # unlimited data and instant generation. The model + beam search
+        # finds good paths despite non-optimal training targets.
+        solution = tuple(move.inverse() for move in reversed(scramble))
         return Episode(
             size=size,
             scramble=scramble,
@@ -560,7 +603,17 @@ def build_dataset_payload(force: bool = False):
             id_val_examples.extend(episode_to_examples(tokenizer, episode))
 
     for size in OOD_DEV_SIZES:
-        episodes = generate_episode_batch(size, OOD_DEV_EPISODES_PER_SIZE, rng=val_rng)
+        if size >= 4:
+            # 4x4+ OOD: use outer-turn-only scrambles (max_width=1) so models
+            # without WMOVE tokens can still be evaluated zero-shot
+            print(f"  Generating {OOD_DEV_EPISODES_PER_SIZE} OOD episodes for size {size} (max_width=1)...")
+            episodes = [
+                generate_teacher_episode(size=size, rng=random.Random(val_rng.randint(0, 2**31)),
+                                        max_width=1)
+                for _ in range(OOD_DEV_EPISODES_PER_SIZE)
+            ]
+        else:
+            episodes = generate_episode_batch(size, OOD_DEV_EPISODES_PER_SIZE, rng=val_rng)
         eval_episodes["ood_dev"].extend(episode.to_dict() for episode in episodes)
         for episode in episodes:
             ood_dev_examples.extend(episode_to_examples(tokenizer, episode))
@@ -724,14 +777,17 @@ def _build_move_token_map(tokenizer: Tokenizer) -> list[dict[int, int]]:
     maps = []
     for rot_idx in range(24):
         token_map = {}
-        for face in FACE_ORDER:
-            for turns, tname in turn_names.items():
-                orig_token = f"MOVE_{face}_{tname}"
-                new_face, new_turns = table[rot_idx][(face, turns)]
-                new_token = f"MOVE_{new_face}_{turn_names[new_turns]}"
-                orig_id = tokenizer.token_to_id[orig_token]
-                new_id = tokenizer.token_to_id[new_token]
-                token_map[orig_id] = new_id
+        for prefix in ("MOVE", "WMOVE"):
+            for face in FACE_ORDER:
+                for turns, tname in turn_names.items():
+                    orig_token = f"{prefix}_{face}_{tname}"
+                    if orig_token not in tokenizer.token_to_id:
+                        continue  # skip WMOVE tokens for smaller vocabs
+                    new_face, new_turns = table[rot_idx][(face, turns)]
+                    new_token = f"{prefix}_{new_face}_{turn_names[new_turns]}"
+                    orig_id = tokenizer.token_to_id[orig_token]
+                    new_id = tokenizer.token_to_id[new_token]
+                    token_map[orig_id] = new_id
         maps.append(token_map)
     return maps
 
@@ -797,6 +853,7 @@ def _augment_example_online(input_ids: list[int], target_ids: list[int],
     # Find sticker start position
     # 2x2: [BOS, TASK_POLICY, SIZE, DIGIT_N, /SIZE, stickers...]  → start=5
     # 3x3: [BOS, TASK_POLICY, SIZE, DIGIT_N, /SIZE, STAGE_X, stickers...] → start=6
+    # 4x4: [BOS, TASK_POLICY, SIZE, DIGIT_N, /SIZE, STAGE_444_X, stickers...] → start=6
     sticker_start = 6 if size >= 3 else 5
     sticker_end = sticker_start + n_stickers
 
@@ -974,6 +1031,8 @@ def _generate_answer_ids(model, prompt_ids: list[int], tokenizer: Tokenizer,
 
 def _build_prompt_ids(tokenizer: Tokenizer, cube: Cube, history: list[Move]) -> list[int]:
     prompt_tokens = build_prompt_tokens(cube.size, cube, history=history)
+    # Filter out tokens not in vocab (e.g., STAGE tokens for 82-token models)
+    prompt_tokens = [t for t in prompt_tokens if t in tokenizer.token_to_id]
     return [tokenizer.get_bos_token_id(), *tokenizer.encode_tokens(prompt_tokens)]
 
 
@@ -1250,7 +1309,7 @@ def _cube_residual_error(cube: Cube) -> int:
 
 
 @torch.no_grad()
-def _beam_search_solve(model, tokenizer: Tokenizer, cube: Cube, beam_width: int = 8, max_steps: int = 200) -> bool:
+def _beam_search_solve(model, tokenizer: Tokenizer, cube: Cube, beam_width: int = 8, max_steps: int = 200, return_trace: bool = False):
     """Beam search rollout: keep multiple partial solutions, expand the most promising."""
     device = next(model.parameters()).device
     autocast_ctx = _autocast_context(device.type)
@@ -1259,7 +1318,7 @@ def _beam_search_solve(model, tokenizer: Tokenizer, cube: Cube, beam_width: int 
         return c.has_uniform_faces() if c.size == 2 else c.is_solved()
 
     if is_goal(cube):
-        return True
+        return (True, []) if return_trace else True
 
     # Each beam: (cube, history, visited, cumulative_value_score)
     initial_state = cube.to_kociemba_string()
@@ -1272,12 +1331,13 @@ def _beam_search_solve(model, tokenizer: Tokenizer, cube: Cube, beam_width: int 
         all_candidates = []
         for beam_idx, (b_cube, b_history, b_visited, b_score) in enumerate(beams):
             if is_goal(b_cube):
-                return True
+                return (True, b_history) if return_trace else True
 
             candidates = _enumerate_move_candidates(model, tokenizer, b_cube, b_history, b_visited)
             for c in candidates:
                 if c["is_goal"]:
-                    return True
+                    trace = [*beams[beam_idx][1], c["move"]]
+                    return (True, trace) if return_trace else True
                 all_candidates.append((beam_idx, c))
 
         if not all_candidates:
@@ -1329,10 +1389,20 @@ def _beam_search_solve(model, tokenizer: Tokenizer, cube: Cube, beam_width: int 
         beams = new_beams
 
     # Check final beams
-    for b_cube, _, _, _ in beams:
+    for b_cube, b_history, _, _ in beams:
         if is_goal(b_cube):
+            if return_trace:
+                return True, b_history
             return True
+    if return_trace:
+        return False, []
     return False
+
+
+def _beam_search_solve_with_trace(model, tokenizer, cube, beam_width=32, max_steps=200):
+    """Beam search that returns (solved, move_trace)."""
+    return _beam_search_solve(model, tokenizer, cube, beam_width=beam_width,
+                              max_steps=max_steps, return_trace=True)
 
 
 @torch.no_grad()
@@ -1382,14 +1452,40 @@ def evaluate_rollouts(model, tokenizer: Tokenizer, episodes: list[Episode]) -> t
         bucket["invalid"] += int(invalid)
         bucket["residual_sum"] += 0.0 if is_solved else _cube_residual_error(cube)
 
+        # 4x4 progress metrics (including solved cubes as stage 4)
+        if episode.size == 4:
+            from rubiks import centers_done_444, paired_edge_count_444, reduction_stage_444
+            bucket.setdefault("centers_done", 0)
+            bucket.setdefault("edges_paired", 0)
+            bucket.setdefault("reduced", 0)
+            bucket.setdefault("stage_sum", 0)
+            try:
+                cd = centers_done_444(cube)
+                pc = paired_edge_count_444(cube)
+                stage = reduction_stage_444(cube)
+                bucket["centers_done"] += int(cd)
+                bucket["edges_paired"] += int(pc == 12)
+                bucket["reduced"] += int(stage >= 3)
+                bucket["stage_sum"] += stage
+            except Exception:
+                pass
+
     size_metrics: dict[int, dict[str, float]] = {}
     for size, stats in per_size.items():
-        size_metrics[size] = {
+        metrics = {
             "count": stats["count"],
             "solve_rate": stats["solved"] / stats["count"],
             "invalid_rate": stats["invalid"] / stats["count"],
             "mean_residual": stats["residual_sum"] / stats["count"],
         }
+        # Add 4x4 progress metrics if available
+        if size == 4 and "stage_sum" in stats:
+            n = stats["count"]
+            metrics["centers_done_rate"] = stats.get("centers_done", 0) / n
+            metrics["edges_paired_rate"] = stats.get("edges_paired", 0) / n
+            metrics["reduced_to_3x3_rate"] = stats.get("reduced", 0) / n
+            metrics["mean_stage_reached"] = stats.get("stage_sum", 0) / n
+        size_metrics[size] = metrics
     return solved / len(episodes), size_metrics
 
 
