@@ -586,32 +586,64 @@ def convert_4x4_to_3x3(cube_4x4: Cube) -> Cube:
 # Self-supervised data generation for each stage
 # ---------------------------------------------------------------------------
 
+def _make_centers_solved_state(rng: random.Random, n_scramble_moves: int = 20) -> Cube:
+    """Create a 4x4 state with solved centers but scrambled corners/edges.
+
+    Starting from solved, apply only outer-face moves (width=1) which scramble
+    corners and edges but preserve center blocks on a 4x4.
+    """
+    cube = Cube(4)
+    last_move_idx = None
+    for _ in range(n_scramble_moves):
+        valid = get_valid_move_indices_4x4(last_move_idx)
+        outer_valid = [i for i in valid if i in _OUTER_MOVE_SET]
+        move_idx = rng.choice(outer_valid)
+        cube.apply_move(ALL_MOVES_4x4[move_idx])
+        last_move_idx = move_idx
+    return cube
+
+
 def sample_stage1_endpoints(
     batch_size: int,
     max_depth: int,
     rng: random.Random,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate training data for stage 1 (center solving).
+    """Generate training data for stage 1 (center solving) via reverse walks.
 
-    Start from solved cube (centers solved), apply random moves,
-    target = 6 - centers_solved_count (how many centers are broken).
+    Strategy (stage-specific reverse training):
+      1. Generate 'centers-solved' states as goals: start from solved cube,
+         apply only outer-face moves (width=1) which scramble corners/edges
+         but preserve center blocks on a 4x4.
+      2. From each centers-solved state, apply K random moves (ANY move
+         including wide moves that break centers). K is sampled from
+         [1, max_depth]. The label is K (distance from centers-solved state).
+      3. Include ~10% goal states with K=0 (target=0) so the model learns
+         the goal state.
+
+    This ensures the training data covers states with partially solved centers
+    (the states beam search actually visits), not just fully-solved or
+    fully-broken extremes.
     """
     all_indices = []
     all_targets = []
 
-    # Include solved state with target 0
-    cube = Cube(4)
-    idx = []
-    for face in FACE_ORDER:
-        for row in cube.face_grid(face):
-            for color in row:
-                idx.append(_COLOR_TO_IDX[color])
-    all_indices.append(idx)
-    all_targets.append(0.0)
+    # ~10% of batch are goal states (K=0) so the model learns target=0
+    n_goals = max(1, batch_size // 10)
 
-    for _ in range(batch_size):
+    for _ in range(n_goals):
+        cube = _make_centers_solved_state(rng)
+        idx = []
+        for face in FACE_ORDER:
+            for row in cube.face_grid(face):
+                for color in row:
+                    idx.append(_COLOR_TO_IDX[color])
+        all_indices.append(idx)
+        all_targets.append(0.0)
+
+    # Remaining samples: reverse walks from centers-solved states
+    for _ in range(batch_size - n_goals):
+        cube = _make_centers_solved_state(rng)
         d = rng.randint(1, max_depth)
-        cube = Cube(4)
         last_move_idx = None
 
         for step in range(d):
@@ -620,9 +652,8 @@ def sample_stage1_endpoints(
             cube.apply_move(ALL_MOVES_4x4[move_idx])
             last_move_idx = move_idx
 
-        # Target: number of unsolved center faces (0-6)
-        # Use walk distance as target (more informative than just broken count)
-        # Blend: use walk distance but clamp by actual broken count
+        # Target = walk distance from centers-solved state
+        # If centers happen to still be solved after the walk, target=0
         broken = 6 - centers_solved_count_444(cube)
         target = float(d) if broken > 0 else 0.0
 
