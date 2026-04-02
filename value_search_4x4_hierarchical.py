@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import heapq
 import math
 import os
 import random
@@ -927,6 +928,137 @@ def beam_search_stage(
 
 
 # ---------------------------------------------------------------------------
+# Weighted A* search for stages 1 and 2 (DeepCubeA-style)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def astar_search_stage(
+    model: StageDistanceNet,
+    cube: Cube,
+    is_done_fn: Callable[[Cube], bool],
+    max_nodes: int = 50000,
+    weight: float = 0.5,
+    device: str = "cuda",
+    allowed_move_indices: Optional[list[int]] = None,
+    batch_size: int = 64,
+) -> tuple[bool, list[Move], int]:
+    """Weighted A* search guided by stage heuristic.
+
+    Uses f(n) = g(n) + W * h(n) where:
+      g(n) = number of moves from start (path cost)
+      h(n) = model's predicted distance to goal (heuristic)
+      W    = weight (lower = more exploration, higher = more greedy)
+
+    Returns (success, move_list, nodes_expanded).
+    """
+    model.eval()
+
+    if is_done_fn(cube):
+        return True, [], 0
+
+    # Initial heuristic score
+    init_state = encode_cube_batch_4x4([cube]).to(device)
+    h0 = model(init_state).item()
+
+    # Priority queue entries: (f_score, tie_breaker, cube, history, last_move_idx)
+    # We store cube and history separately; tie_breaker ensures stable ordering.
+    counter = 0
+    open_heap: list[tuple[float, int, Cube, list[int], Optional[int]]] = []
+    heapq.heappush(open_heap, (weight * h0, counter, cube.copy(), [], None))
+    counter += 1
+
+    visited: set[str] = {cube.to_kociemba_string()}
+    nodes_expanded = 0
+
+    # Batch expansion buffer
+    pending_children: list[tuple[Cube, list[int], int, str, int]] = []
+    # (child_cube, history, last_move_idx, state_key, g_cost)
+
+    def _flush_pending():
+        """Score pending children and push them onto the open heap."""
+        nonlocal counter
+        if not pending_children:
+            return
+
+        cubes_to_score = [c for c, _, _, _, _ in pending_children]
+        states = encode_cube_batch_4x4(cubes_to_score).to(device)
+
+        # Score in chunks for memory safety
+        chunk_size = 4096
+        all_h = []
+        for i in range(0, len(cubes_to_score), chunk_size):
+            chunk = states[i:i + chunk_size]
+            h_vals = model(chunk).cpu()
+            all_h.append(h_vals)
+        h_values = torch.cat(all_h, dim=0)
+
+        for idx, (child_cube, hist, last_idx, key, g) in enumerate(pending_children):
+            h = h_values[idx].item()
+            f = float(g) + weight * h
+            heapq.heappush(open_heap, (f, counter, child_cube, hist, last_idx))
+            counter += 1
+
+        pending_children.clear()
+
+    while nodes_expanded < max_nodes:
+        # Flush any accumulated children before picking next node
+        if pending_children:
+            _flush_pending()
+        if not open_heap:
+            break
+
+        f_score, _, current_cube, history, last_move_idx = heapq.heappop(open_heap)
+        g = len(history)
+
+        # Goal check
+        if is_done_fn(current_cube):
+            moves = [ALL_MOVES_4x4[i] for i in history]
+            return True, moves, nodes_expanded
+
+        nodes_expanded += 1
+
+        # Expand children
+        valid_moves = get_valid_move_indices_4x4(last_move_idx)
+        if allowed_move_indices is not None:
+            valid_moves = [m for m in valid_moves if m in allowed_move_indices]
+
+        for move_idx in valid_moves:
+            move = ALL_MOVES_4x4[move_idx]
+            child = current_cube.copy()
+            child.apply_move(move)
+            state_key = child.to_kociemba_string()
+
+            if state_key in visited:
+                continue
+            visited.add(state_key)
+
+            child_hist = history + [move_idx]
+            child_g = g + 1
+
+            # Check goal immediately to avoid unnecessary scoring
+            if is_done_fn(child):
+                moves = [ALL_MOVES_4x4[i] for i in child_hist]
+                return True, moves, nodes_expanded
+
+            pending_children.append((child, child_hist, move_idx, state_key, child_g))
+
+        # Flush when batch is full
+        if len(pending_children) >= batch_size:
+            _flush_pending()
+
+    # Flush remaining and try one more round
+    _flush_pending()
+    while open_heap and nodes_expanded < max_nodes:
+        f_score, _, current_cube, history, last_move_idx = heapq.heappop(open_heap)
+        if is_done_fn(current_cube):
+            moves = [ALL_MOVES_4x4[i] for i in history]
+            return True, moves, nodes_expanded
+        nodes_expanded += 1
+
+    return False, [], nodes_expanded
+
+
+# ---------------------------------------------------------------------------
 # Stage 3: Use 3x3 solver
 # ---------------------------------------------------------------------------
 
@@ -1350,6 +1482,59 @@ def evaluate_stage(
     }
 
 
+@torch.no_grad()
+def evaluate_stage_astar(
+    model: StageDistanceNet,
+    stage: int,
+    num_cubes: int = 50,
+    scramble_length: int = 20,
+    max_nodes: int = 50000,
+    weight: float = 0.5,
+    device: str = "cuda",
+    seed: int = 42,
+) -> dict:
+    """Evaluate a single stage heuristic using weighted A* search."""
+    rng = random.Random(seed)
+    is_done_fn = stage1_is_done if stage == 1 else stage2_is_done
+
+    solved_count = 0
+    total_moves = 0
+    total_nodes = 0
+
+    for i in range(num_cubes):
+        if stage == 2:
+            # Stage 2 eval: start from reduced state (centers solved), then break edges
+            cube = _make_reduced_state(rng)
+            moves_all = [Move(face=f, depth=1, width=w, turns=t)
+                         for f in "URFDLB" for w in [1, 2] for t in [1, -1, 2]]
+            for _ in range(scramble_length):
+                cube.apply_move(rng.choice(moves_all))
+        else:
+            # Stage 1 eval: fully scrambled cube
+            scramble = random_scramble(4, scramble_length, rng, max_depth=1, max_width=2)
+            cube = Cube(4)
+            cube.apply_moves(scramble)
+
+        ok, moves, nodes = astar_search_stage(
+            model, cube, is_done_fn,
+            max_nodes=max_nodes, weight=weight, device=device,
+        )
+
+        if ok:
+            solved_count += 1
+            total_moves += len(moves)
+        total_nodes += nodes
+
+    n = num_cubes
+    return {
+        "solve_rate": solved_count / n,
+        "solved": solved_count,
+        "total": n,
+        "mean_solution_length": total_moves / max(1, solved_count),
+        "mean_nodes": total_nodes / n,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Training loop for a single stage
 # ---------------------------------------------------------------------------
@@ -1498,29 +1683,54 @@ def train_stage(args):
 
         # Evaluation
         if global_step % args.eval_interval == 0:
-            print(f"\n--- Stage {stage} Evaluation at step {global_step} ---")
-            for bw in args.eval_beam_widths:
-                results = evaluate_stage(
+            search_type = getattr(args, "search_type", "beam")
+            print(f"\n--- Stage {stage} Evaluation at step {global_step} ({search_type}) ---")
+            if search_type == "astar":
+                results = evaluate_stage_astar(
                     model, stage,
                     num_cubes=args.eval_num_cubes,
                     scramble_length=args.eval_scramble_length,
-                    beam_width=bw,
-                    max_steps=args.eval_max_steps,
+                    max_nodes=args.astar_max_nodes,
+                    weight=args.astar_weight,
                     device=device,
                     seed=args.eval_seed,
                 )
                 print(
-                    f"  beam_width={bw:4d}: stage{stage}_rate={results['solve_rate']:.3f} "
+                    f"  astar(W={args.astar_weight}, max_nodes={args.astar_max_nodes}): "
+                    f"stage{stage}_rate={results['solve_rate']:.3f} "
                     f"({results['solved']}/{results['total']}) "
                     f"mean_sol_len={results['mean_solution_length']:.1f} "
                     f"mean_nodes={results['mean_nodes']:.0f}"
                 )
                 if use_wandb:
                     wandb.log({
-                        f"eval/stage{stage}_rate_bw{bw}": results["solve_rate"],
-                        f"eval/mean_sol_len_bw{bw}": results["mean_solution_length"],
-                        f"eval/mean_nodes_bw{bw}": results["mean_nodes"],
+                        f"eval/stage{stage}_rate_astar": results["solve_rate"],
+                        f"eval/mean_sol_len_astar": results["mean_solution_length"],
+                        f"eval/mean_nodes_astar": results["mean_nodes"],
                     }, step=global_step)
+            else:
+                for bw in args.eval_beam_widths:
+                    results = evaluate_stage(
+                        model, stage,
+                        num_cubes=args.eval_num_cubes,
+                        scramble_length=args.eval_scramble_length,
+                        beam_width=bw,
+                        max_steps=args.eval_max_steps,
+                        device=device,
+                        seed=args.eval_seed,
+                    )
+                    print(
+                        f"  beam_width={bw:4d}: stage{stage}_rate={results['solve_rate']:.3f} "
+                        f"({results['solved']}/{results['total']}) "
+                        f"mean_sol_len={results['mean_solution_length']:.1f} "
+                        f"mean_nodes={results['mean_nodes']:.0f}"
+                    )
+                    if use_wandb:
+                        wandb.log({
+                            f"eval/stage{stage}_rate_bw{bw}": results["solve_rate"],
+                            f"eval/mean_sol_len_bw{bw}": results["mean_solution_length"],
+                            f"eval/mean_nodes_bw{bw}": results["mean_nodes"],
+                        }, step=global_step)
             print(flush=True)
 
         # Checkpoint
@@ -1646,6 +1856,15 @@ def parse_args():
                         help="Beam widths for evaluation")
     parser.add_argument("--eval_seed", type=int, default=42,
                         help="Seed for eval scrambles")
+
+    # Search type for evaluation
+    parser.add_argument("--search_type", type=str, default="beam",
+                        choices=["beam", "astar"],
+                        help="Search algorithm for eval: 'beam' or 'astar'")
+    parser.add_argument("--astar_weight", type=float, default=0.5,
+                        help="Weight W in f = g + W*h for A* search")
+    parser.add_argument("--astar_max_nodes", type=int, default=50000,
+                        help="Maximum nodes to expand in A* search")
 
     # Pipeline eval settings
     parser.add_argument("--pipeline_num_cubes", type=int, default=50,
