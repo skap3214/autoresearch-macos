@@ -113,3 +113,11 @@ def solve_cube_444(cube: Cube) -> tuple[Move, ...]:
 
     from rubikscubennnsolver.RubiksCube444 import RubiksCube444
     return _solve_cube(cube, RubiksCube444, lambda c: c.is_solved())
+
+
+def solve_cube_555(cube: Cube) -> tuple[Move, ...]:
+    if cube.size != 5:
+        raise ValueError(f"solve_cube_555 only supports 5x5, got {cube.size}")
+
+    from rubikscubennnsolver.RubiksCube555 import RubiksCube555
+    return _solve_cube(cube, RubiksCube555, lambda c: c.is_solved())
