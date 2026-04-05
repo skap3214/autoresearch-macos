@@ -33,7 +33,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from rubiks import Cube, Move, FACE_ORDER
+from rubiks import Cube, Move, FACE_ORDER, FACE_NORMALS, FACE_COLORS, FACE_VIEW_BASIS
+from rubiks import get_symmetry_rotations, transform_move, rotate_vec
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -57,6 +58,151 @@ N_ACTIONS = len(ALL_MOVES_5x5)  # 36
 MOVE_TO_IDX = {}
 for _i, _m in enumerate(ALL_MOVES_5x5):
     MOVE_TO_IDX[(_m.face, _m.width, _m.turns)] = _i
+
+# ---------------------------------------------------------------------------
+# 24x rotational symmetry augmentation (precomputed tables)
+# ---------------------------------------------------------------------------
+
+def _precompute_symmetry_tables():
+    """Precompute permutation and color tables for all 24 rotational symmetries.
+
+    Returns:
+        sticker_perm: (24, 54) int array — sticker_perm[r][i] = source index for
+            position i under rotation r (i.e. new_stickers[i] = old_stickers[perm[i]])
+        color_map: (24, 6) int array — color_map[r][old_color] = new_color
+        action_map: (24, 36) int array — action_map[r][old_action] = new_action
+    """
+    rotations = get_symmetry_rotations()
+    normal_to_face = {v: k for k, v in FACE_NORMALS.items()}
+    face_to_idx = {f: i for i, f in enumerate(FACE_ORDER)}
+
+    # 3x3 center grid positions within a face (row, col) in order
+    grid_positions = [(r, c) for r in range(3) for c in range(3)]
+
+    sticker_perm = []  # 24 x 54
+    color_map_table = []  # 24 x 6
+    action_map_table = []  # 24 x 36
+
+    for rot_idx, rot in enumerate(rotations):
+        perm = [0] * 54
+        cmap = [0] * 6
+
+        # For each original face, find where it maps to
+        for src_face in FACE_ORDER:
+            src_fidx = face_to_idx[src_face]
+
+            # Map the face normal under the rotation
+            n = FACE_NORMALS[src_face]
+            for axis, qt in rot:
+                n = rotate_vec(n, axis, qt)
+            dst_face = normal_to_face[n]
+            dst_fidx = face_to_idx[dst_face]
+
+            # Color relabeling: src_face's color -> dst_face's color
+            src_color_idx = COLOR_TO_IDX[FACE_COLORS[src_face]]
+            dst_color_idx = COLOR_TO_IDX[FACE_COLORS[dst_face]]
+            cmap[src_color_idx] = dst_color_idx
+
+            # Now figure out how the 3x3 grid within the face transforms.
+            # The grid is defined by (up_vec, right_vec) for viewing.
+            # Under rotation, the up/right vectors of src_face transform,
+            # and we need to express them in terms of dst_face's up/right.
+            src_up, src_right = FACE_VIEW_BASIS[src_face]
+            dst_up, dst_right = FACE_VIEW_BASIS[dst_face]
+
+            # Transform src_up and src_right under the rotation
+            rot_src_up = src_up
+            rot_src_right = src_right
+            for axis, qt in rot:
+                rot_src_up = rotate_vec(rot_src_up, axis, qt)
+                rot_src_right = rotate_vec(rot_src_right, axis, qt)
+
+            # Express rot_src_up and rot_src_right in the dst_face basis
+            # rot_src_up = a * dst_up + b * dst_right (both are unit vectors on the face plane)
+            # dot products give the coefficients
+            def dot3(a, b):
+                return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+            # In grid coords: row = -dot(pos, up), col = dot(pos, right)
+            # The transformed grid position of (row, col) from src is:
+            #   new_row_contribution = -dot(pos_contribution, dst_up)
+            #   But pos = -row*src_up + col*src_right (in continuous coords)
+            # After rotation: pos' = -row*rot_src_up + col*rot_src_right
+            # new_row = -dot(pos', dst_up) = row*dot(rot_src_up, dst_up) - col*dot(rot_src_right, dst_up)
+            # new_col = dot(pos', dst_right) = -row*dot(rot_src_up, dst_right) + col*dot(rot_src_right, dst_right)
+
+            a_uu = dot3(rot_src_up, dst_up)
+            a_ru = dot3(rot_src_right, dst_up)
+            a_ur = dot3(rot_src_up, dst_right)
+            a_rr = dot3(rot_src_right, dst_right)
+
+            for src_pos_idx, (sr, sc) in enumerate(grid_positions):
+                # Map (sr, sc) from 0-2 range to centered coords (-1, 0, 1)
+                cr, cc = sr - 1, sc - 1
+                # new centered coords
+                new_cr = int(cr * a_uu - cc * a_ru)
+                new_cc = int(-cr * a_ur + cc * a_rr)
+                # Back to 0-2 range
+                new_r, new_c = new_cr + 1, new_cc + 1
+                dst_pos_idx = new_r * 3 + new_c
+
+                # perm: new_stickers[dst_fidx*9 + dst_pos_idx] = old_stickers[src_fidx*9 + src_pos_idx]
+                perm[dst_fidx * 9 + dst_pos_idx] = src_fidx * 9 + src_pos_idx
+
+        sticker_perm.append(perm)
+        color_map_table.append(cmap)
+
+        # Action map
+        amap = [0] * N_ACTIONS
+        for src_action_idx, move in enumerate(ALL_MOVES_5x5):
+            new_move = transform_move(move, rot_idx)
+            new_key = (new_move.face, new_move.width, new_move.turns)
+            amap[src_action_idx] = MOVE_TO_IDX[new_key]
+        action_map_table.append(amap)
+
+    return sticker_perm, color_map_table, action_map_table
+
+
+# Precompute at import time
+_SYM_STICKER_PERM, _SYM_COLOR_MAP, _SYM_ACTION_MAP = _precompute_symmetry_tables()
+
+# Convert to tensors for fast GPU-side augmentation
+_SYM_STICKER_PERM_T = torch.tensor(_SYM_STICKER_PERM, dtype=torch.long)  # (24, 54)
+_SYM_ACTION_MAP_T = torch.tensor(_SYM_ACTION_MAP, dtype=torch.long)      # (24, 36)
+
+
+def augment_center_batch(states: torch.Tensor, actions: torch.Tensor
+                         ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply random 24x rotational symmetry augmentation to a batch.
+
+    Under a whole-cube rotation, physical stickers move to new face positions
+    but retain their original colors (no color relabeling needed).
+
+    Args:
+        states: (B, 54) LongTensor of color indices
+        actions: (B,) LongTensor of action indices
+    Returns:
+        aug_states: (B, 54) LongTensor
+        aug_actions: (B,) LongTensor
+    """
+    B = states.size(0)
+    device = states.device
+
+    # Pick a random rotation for each example
+    rot_ids = torch.randint(0, 24, (B,))
+
+    # Gather permutation and action map for each example
+    perm = _SYM_STICKER_PERM_T[rot_ids].to(device)   # (B, 54)
+    amap = _SYM_ACTION_MAP_T[rot_ids].to(device)      # (B, 36)
+
+    # Step 1: Permute sticker positions (colors stay the same)
+    aug_states = torch.gather(states, 1, perm)  # (B, 54)
+
+    # Step 2: Transform actions
+    aug_actions = torch.gather(amap, 1, actions.unsqueeze(1)).squeeze(1)  # (B,)
+
+    return aug_states, aug_actions
+
 
 DATA_DIR = _PROJECT_ROOT / "data_5x5_teacher"
 DATA_FILE = DATA_DIR / "center_data.pkl"
@@ -258,7 +404,7 @@ class CenterPolicyValueNet(nn.Module):
     Output: policy (36-way) + value (scalar distance estimate)
     """
 
-    def __init__(self, embed_dim: int = 32, hidden_dim: int = 512, n_layers: int = 4,
+    def __init__(self, embed_dim: int = 64, hidden_dim: int = 1024, n_layers: int = 6,
                  dropout: float = 0.1):
         super().__init__()
         self.embed = nn.Embedding(NUM_COLORS, embed_dim)
@@ -374,6 +520,8 @@ def train(hours: float = 2.0, batch_size: int = 256, lr: float = 1e-3,
         total = 0
 
         for batch_states, batch_actions, batch_distances in train_loader:
+            # Apply 24x rotational symmetry augmentation (online, random per-example)
+            batch_states, batch_actions = augment_center_batch(batch_states, batch_actions)
             batch_states = batch_states.to(device)
             batch_actions = batch_actions.to(device)
             batch_distances = batch_distances.to(device)
