@@ -456,49 +456,69 @@ class CenterPolicyValueNet(nn.Module):
 # Training
 # ---------------------------------------------------------------------------
 
-def train(hours: float = 2.0, batch_size: int = 256, lr: float = 1e-3,
+def train(hours: float = 2.0, batch_size: int = 16384, lr: float = 1e-3,
           policy_weight: float = 1.0, value_weight: float = 0.1):
     """Train the center policy+value net on teacher data."""
 
-    if not DATA_FILE.exists():
-        print(f"ERROR: Data file {DATA_FILE} not found. Run --generate first.")
+    # Try fast tensor format first, fall back to pickle
+    tensor_file = DATA_FILE.parent / "center_data_tensors.pt"
+    if tensor_file.exists():
+        print("Loading pre-converted tensor data (fast path)...")
+        data = torch.load(tensor_file, map_location="cpu", weights_only=False)
+        all_states = data["states"]
+        all_actions = data["actions"]
+        all_distances = data["distances"]
+        print(f"Loaded {len(all_states):,} examples as tensors")
+    elif DATA_FILE.exists():
+        print("Loading pickle data (slow path)...")
+        with open(DATA_FILE, "rb") as f:
+            data = pickle.load(f)
+        all_states = torch.tensor(data["states"], dtype=torch.long)
+        all_actions = torch.tensor(data["actions"], dtype=torch.long)
+        all_distances = torch.tensor(data["distances"], dtype=torch.float32)
+        print(f"Loaded {len(all_states):,} examples from {data['num_cubes']} cubes")
+    else:
+        print(f"ERROR: No data found. Run --generate first.")
         sys.exit(1)
 
-    with open(DATA_FILE, "rb") as f:
-        data = pickle.load(f)
-
-    states = data["states"]
-    actions = data["actions"]
-    distances = data["distances"]
-    print(f"Loaded {len(states)} training examples from {data['num_cubes']} cubes")
-
-    # Split into train/val (90/10)
-    n = len(states)
-    indices = list(range(n))
-    random.Random(42).shuffle(indices)
+    # Split into train/val (90/10) — all on GPU for zero-overhead loading
+    n = len(all_states)
+    perm = torch.randperm(n, generator=torch.Generator().manual_seed(42))
     split = int(0.9 * n)
-    train_idx = indices[:split]
-    val_idx = indices[split:]
-
-    train_states = [states[i] for i in train_idx]
-    train_actions = [actions[i] for i in train_idx]
-    train_distances = [distances[i] for i in train_idx]
-
-    val_states = [states[i] for i in val_idx]
-    val_actions = [actions[i] for i in val_idx]
-    val_distances = [distances[i] for i in val_idx]
-
-    train_ds = CenterDataset(train_states, train_actions, train_distances)
-    val_ds = CenterDataset(val_states, val_actions, val_distances)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
+    train_idx = perm[:split]
+    val_idx = perm[split:]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Move ALL data to GPU — zero CPU->GPU transfer during training
+    train_states = all_states[train_idx].to(device)
+    train_actions = all_actions[train_idx].to(device)
+    train_distances = all_distances[train_idx].to(device)
+    val_states = all_states[val_idx].to(device)
+    val_actions = all_actions[val_idx].to(device)
+    val_distances = all_distances[val_idx].to(device)
+    del all_states, all_actions, all_distances  # free CPU memory
+    print(f"Data on GPU: {train_states.shape[0]:,} train, {val_states.shape[0]:,} val")
+
     model = CenterPolicyValueNet().to(device)
     print(f"Model parameters: {model.count_parameters():,}")
+
+    # Resume from checkpoint if exists
+    if MODEL_FILE.exists():
+        ckpt = torch.load(MODEL_FILE, map_location=device, weights_only=False)
+        try:
+            state_dict = ckpt["model_state_dict"]
+            # Strip '_orig_mod.' prefix if present (from torch.compile)
+            cleaned = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            model.load_state_dict(cleaned)
+            print(f"Resumed from checkpoint (epoch {ckpt.get('epoch', '?')})")
+        except RuntimeError as e:
+            print(f"Checkpoint incompatible ({e}), training from scratch")
+
+    # Speed optimizations
+    model = torch.compile(model)
+    torch.set_float32_matmul_precision("high")
+    print("Using torch.compile + bf16 + TF32")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -519,14 +539,18 @@ def train(hours: float = 2.0, batch_size: int = 256, lr: float = 1e-3,
         correct = 0
         total = 0
 
-        for batch_states, batch_actions, batch_distances in train_loader:
-            # Apply 24x rotational symmetry augmentation (online, random per-example)
-            batch_states, batch_actions = augment_center_batch(batch_states, batch_actions)
-            batch_states = batch_states.to(device)
-            batch_actions = batch_actions.to(device)
-            batch_distances = batch_distances.to(device)
+        # Shuffle training data each epoch (GPU-side, no CPU overhead)
+        train_perm = torch.randperm(train_states.shape[0], device=device)
+        num_batches = train_states.shape[0] // batch_size
 
-            policy_logits, value_pred = model(batch_states)
+        for b in range(num_batches):
+            idx = train_perm[b * batch_size:(b + 1) * batch_size]
+            batch_states = train_states[idx]
+            batch_actions = train_actions[idx]
+            batch_distances = train_distances[idx]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                policy_logits, value_pred = model(batch_states)
 
             policy_loss = F.cross_entropy(policy_logits, batch_actions)
             value_loss = F.smooth_l1_loss(value_pred, batch_distances)
@@ -557,12 +581,16 @@ def train(hours: float = 2.0, batch_size: int = 256, lr: float = 1e-3,
         val_total = 0
         val_vloss = 0.0
         with torch.no_grad():
-            for batch_states, batch_actions, batch_distances in val_loader:
-                batch_states = batch_states.to(device)
-                batch_actions = batch_actions.to(device)
-                batch_distances = batch_distances.to(device)
+            val_num_batches = val_states.shape[0] // batch_size + 1
+            for b in range(val_num_batches):
+                batch_states = val_states[b * batch_size:(b + 1) * batch_size]
+                batch_actions = val_actions[b * batch_size:(b + 1) * batch_size]
+                batch_distances = val_distances[b * batch_size:(b + 1) * batch_size]
+                if batch_states.shape[0] == 0:
+                    break
 
-                policy_logits, value_pred = model(batch_states)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    policy_logits, value_pred = model(batch_states)
                 preds = policy_logits.argmax(dim=-1)
                 val_correct += (preds == batch_actions).sum().item()
                 val_total += batch_states.size(0)
@@ -694,6 +722,7 @@ def evaluate(num_cubes: int = 200, scramble_len: int = 30, seed: int = 123):
     model.eval()
     print(f"Loaded model from epoch {ckpt['epoch']} (val_acc={ckpt['val_acc']:.4f})")
     print(f"Model parameters: {model.count_parameters():,}")
+
 
     rng = random.Random(seed)
 
